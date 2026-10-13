@@ -1,0 +1,58 @@
+# Build trees, SDKs, toolchains and generated binaries
+build/
+*.bin
+*.ko
+*.pcap
+*.sigmf-*
+*.iq
+__pycache__/
+*.pyc
+vita49-control
+
+# Proprietary MediaTek firmware blobs: pulled locally for analysis, never
+# redistributed (see vendor/README.md).
+vendor/*
+!vendor/README.md
+
+# SSH keys / host-specific
+*.pub
+known_hosts*
+
+# nds32 binutils (rebuild from GNU Binutils 2.42 — see docs/reproduce.md)
+tools/nds32-objdump
+tools/nds32-as
+tools/nds32-ld
+tools/nds32-objcopy
+tools/ldscripts/
+
+# ---------------------------------------------------------------------------
+# Local engineering notes, session logs and raw device backups. These live on
+# the maintainer's machine and are deliberately NOT part of the published tree.
+# ---------------------------------------------------------------------------
+/STATE.md
+/scratch/
+/device-backup/
+/docs/build-notes.md
+/docs/capture-engine.md
+/docs/device-recon.md
+/docs/firmware-analysis.md
+/docs/plan.md
+/docs/poc-custom-code.md
+/docs/port-plan.md
+/docs/roadmap.md
+/docs/review-2026-10-15.md
+/docs/offline-fixes-2026-10-15.md
+/docs/live-validation-2026-10-15.md
+/docs/packed14-review.md
+
+# Superseded by kernel/mt7915-icap/complete-local.patch; kept locally only.
+/kernel/mt7915-icap/debugfs.patch
+/kernel/mt7915-icap/events.patch
+/kernel/mt7915-icap/quiet-trigger.patch
+/kernel/mt7915-icap/relay-committed.patch
+/kernel/mt7915-icap/udp-export.patch
+/kernel/owrt_one_sdr/
+/host/controller/soapy-control-timeout.patch
+
+# RF captures reveal the local radio environment (neighbouring networks) — not published.
+/docs/images/

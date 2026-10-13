@@ -1,0 +1,47 @@
+This project is distributed under more than one licence. Every source file
+names its own licence in an SPDX-License-Identifier line; the full texts are
+in LICENSES/.
+
+  MIT            everything not listed below: the host software, the vendored
+                 spectrum viewer, the MT7981 firmware tooling, the register and
+                 recipe documentation, and the build and install scripts
+  ISC            files that derive from MediaTek's mt76 driver
+                 (kernel/mt7915-icap/), which keep MediaTek's copyright
+
+The spectrum viewer under host/spectrum/ and the stream header
+host/stream/include/w1700k_stream.h are vendored from W1700K-SDR, MIT,
+Copyright (c) 2026 h0m3us3r; their SPDX headers and copyright are kept
+verbatim and are not relicensed. Modifications made for this project are
+marked in-file.
+
+MediaTek's Wi-Fi firmware is proprietary and is NOT redistributed in this
+repository. The firmware/ tooling patches a copy of the firmware that the
+running OpenWrt system already carries; no MediaTek binary or source is
+committed here (see .gitignore). The MT7981 firmware code added by this
+project is built locally from source and contains no MediaTek code.
+
+Copyright (c) 2026 CEMAXECUTER LLC (original work).
+
+---
+
+MIT License
+
+Copyright (c) 2026 CEMAXECUTER LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
