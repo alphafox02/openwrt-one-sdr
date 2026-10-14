@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+# One-shot driver test, before START=10 kmodloader. Next boot restores stock.
+START=02
+boot() {
+    target=/lib/modules/$(uname -r)/mt7915e.ko
+    [ -f /root/mt7915e.stock.ko ] || return 1
+    if [ -f /root/mt7915e.sdr-arm ]; then
+        rm -f /root/mt7915e.sdr-arm
+        sync
+        cp /root/mt7915e.sdr-test.ko "$target"
+    else
+        cp /root/mt7915e.stock.ko "$target"
+    fi
+    sync
+}

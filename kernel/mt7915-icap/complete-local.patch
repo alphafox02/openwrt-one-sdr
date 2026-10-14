@@ -1,0 +1,773 @@
+# SPDX-License-Identifier: ISC
+# mt7915 driver changes for the MT7981: the ICAP capture debugfs knobs, the
+# relay/event plumbing and the VITA 49 UDP exporter, plus the experimental BSS
+# gate. Apply once to pristine mt76 c246fa545119abe5097682316700f13c91399042.
+--- a/mt7915/testmode.c
++++ b/mt7915/testmode.c
+@@ -508,6 +508,85 @@
+ 				 sizeof(req), true);
+ }
+ 
++/* openwrt-one-sdr: FLEXIBLE raw RF_TEST sender to find+drive the iCap capture
++ * command. We hold a raw command-body buffer we fill byte-by-byte from userspace,
++ * then fire it as MCU_EXT_CMD(RF_TEST). This lets us experiment with the exact
++ * func_idx and iCap param layout (band/opmode/bw/antenna) that triggers the WM's
++ * icapSpectrumInit, since the func_idx->handler map is runtime-registered.
++ * u64 val opcode in [63:56]:
++ *   0x00  clear the buffer (and set default len 88)
++ *   0x01  set byte: [31:16]=offset  [7:0]=value
++ *   0x02  set send length: [15:0]=len
++ *   0x10  send a bare RF_OPER_ICAP switch (op_mode=RF_OPER_ICAP)
++ *   0x11  send a bare RF_OPER_WIFI_SPECTRUM switch
++ *   0xFF  FIRE: send the raw buffer as the RF_TEST body (len bytes)
++ * Buffer layout (struct mt7915_tm_rf_test): action@0 icap_len@1 rsv@2-3
++ *   func_idx@4-7  param@8-87. */
++static u8 icap_buf[128];
++static u32 icap_len_g = 88;
++
++int mt7915_tm_icap_prime(struct mt7915_dev *dev, u64 val)
++{
++	u32 op = (val >> 56) & 0xff;
++	int ret;
++
++	switch (op) {
++	case 0x00:
++		memset(icap_buf, 0, sizeof(icap_buf));
++		icap_len_g = 88;
++		return 0;
++	case 0x01: {
++		u32 off = (val >> 16) & 0xffff;
++		if (off < sizeof(icap_buf))
++			icap_buf[off] = val & 0xff;
++		return 0;
++	}
++	case 0x02:
++		icap_len_g = val & 0xffff;
++		if (icap_len_g > sizeof(icap_buf))
++			icap_len_g = sizeof(icap_buf);
++		return 0;
++	case 0x10:
++	case 0x11: {
++		struct mt7915_tm_rf_test req = {
++			.op.op_mode = cpu_to_le32(op == 0x10 ? RF_OPER_ICAP :
++						  RF_OPER_WIFI_SPECTRUM),
++		};
++		ret = mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(RF_TEST), &req,
++					sizeof(req), true);
++		dev_info(dev->mt76.dev, "icap: op_mode switch op=0x%x ret=%d\n", op, ret);
++		return ret;
++	}
++	case 0xff:	/* fire buf as MCU_EXT_CMD(RF_TEST=4) = BirriaSDR ext() */
++		ret = mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(RF_TEST), icap_buf,
++					icap_len_g, false);
++		dev_info(dev->mt76.dev,
++			 "icap: EXT4 len=%u [0..11]=%*ph ret=%d\n",
++			 icap_len_g, 12, icap_buf, ret);
++		return ret;
++	case 0x14: /* MT7981 native ICAP/SPECTRUM extended command 0x56 */
++		ret = mt76_mcu_send_msg(&dev->mt76, 0x56ed, icap_buf,
++					icap_len_g, false);
++		/* Serial console printk can block this CPU for milliseconds just
++		 * as IQ starts. Keep the streaming trigger free of console I/O. */
++		if (ret || get_unaligned_le32(icap_buf) != 6)
++			dev_info(dev->mt76.dev, "icap: EXT56 len=%u ret=%d\n",
++				 icap_len_g, ret);
++		return ret;
++	case 0x13:	/* fire buf as MCU_CE_CMD(1) = BirriaSDR ce(); raw cmd word
++			 * = __MCU_CMD_FIELD_CE(1<<18) | CID 1 = 0x40001 */
++		ret = mt76_mcu_send_msg(&dev->mt76, 0x40001, icap_buf,
++					icap_len_g, false);
++		dev_info(dev->mt76.dev,
++			 "icap: CE1 len=%u [0..11]=%*ph ret=%d\n",
++			 icap_len_g, 12, icap_buf, ret);
++		return ret;
++	default:
++		dev_info(dev->mt76.dev, "icap: unknown op 0x%x\n", op);
++		return -EINVAL;
++	}
++}
++
+ static int
+ mt7915_tm_set_tx_cont(struct mt7915_phy *phy, bool en)
+ {
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2013,6 +2013,13 @@
+ 					       mac_work.work);
+ 	phy = mphy->priv;
+ 
++	/* openwrt-one-sdr: while a continuous IQ capture (func6) owns the WM, the
++	 * periodic MIB/stats MCU commands (GET_MIB_INFO) time out and
++	 * mt7915_mac_severe_check() triggers SER recovery that aborts the stream at
++	 * ~4 s. Skip all of it while iq_export is active; just reschedule. */
++	if (rcu_access_pointer(phy->dev->iq_export))
++		goto reschedule;
++
+ 	mutex_lock(&mphy->dev->mutex);
+ 
+ 	mt76_update_survey(mphy);
+@@ -2030,6 +2037,7 @@
+ 
+ 	mt76_tx_status_check(mphy->dev, false);
+ 
++reschedule:
+ 	ieee80211_queue_delayed_work(mphy->hw, &mphy->mac_work,
+ 				     MT7915_WATCHDOG_TIME);
+ }
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -582,6 +582,8 @@
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_fw_debug_wa, mt7915_fw_debug_wa_get,
+ 			 mt7915_fw_debug_wa_set, "%lld\n");
+ 
++#include "relay-committed.inc"
++
+ static struct dentry *
+ create_buf_file_cb(const char *filename, struct dentry *parent, umode_t mode,
+ 		   struct rchan_buf *buf, int *is_global)
+@@ -589,7 +591,7 @@
+ 	struct dentry *f;
+ 
+ 	f = debugfs_create_file("fwlog_data", mode, parent, buf,
+-				&relay_file_operations);
++				&mt7915_fwlog_fops);
+ 	if (IS_ERR(f))
+ 		return NULL;
+ 
+@@ -617,7 +619,7 @@
+ 
+ 	if (!dev->relay_fwlog)
+ 		dev->relay_fwlog = relay_open("fwlog_data", dev->debugfs_dir,
+-					    1500, 512, &relay_cb, NULL);
++					    65536, 512, &relay_cb, NULL);
+ 	if (!dev->relay_fwlog)
+ 		return -ENOMEM;
+ 
+@@ -1204,6 +1206,19 @@
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_rf_regval, mt7915_rf_regval_get,
+ 			 mt7915_rf_regval_set, "0x%08llx\n");
+ 
++/* openwrt-one-sdr: write icap_len (low 8 bits) | freq<<8 to prime iCap. */
++static int mt7915_icap_prime_set(void *data, u64 val)
++{
++	struct mt7915_dev *dev = data;
++
++	return mt7915_tm_icap_prime(dev, val);
++}
++DEFINE_DEBUGFS_ATTRIBUTE(fops_icap_prime, NULL, mt7915_icap_prime_set, "%lld\n");
++
++#include "window.inc"
++
++#include "udp-export.inc"
++
+ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
+@@ -1213,6 +1228,9 @@
+ 	dir = mt76_register_debugfs_fops(phy->mt76, NULL);
+ 	if (!dir)
+ 		return -ENOMEM;
++	debugfs_create_file("iq_udp", 0600, dir, dev, &mt7915_iq_config_fops);
++	debugfs_create_file("icap_window", 0400, dir, dev, &fops_icap_window);
++	debugfs_create_file("icap_prime", 0600, dir, dev, &fops_icap_prime);
+ 	debugfs_create_file("muru_debug", 0600, dir, dev, &fops_muru_debug);
+ 	debugfs_create_file("muru_stats", 0400, dir, phy,
+ 			    &mt7915_muru_stats_fops);
+@@ -1257,11 +1275,10 @@
+ mt7915_debugfs_write_fwlog(struct mt7915_dev *dev, const void *hdr, int hdrlen,
+ 			 const void *data, int len)
+ {
+-	static DEFINE_SPINLOCK(lock);
+ 	unsigned long flags;
+ 	void *dest;
+ 
+-	spin_lock_irqsave(&lock, flags);
++	spin_lock_irqsave(&mt7915_fwlog_lock, flags);
+ 	dest = relay_reserve(dev->relay_fwlog, hdrlen + len + 4);
+ 	if (dest) {
+ 		*(u32 *)dest = hdrlen + len;
+@@ -1275,7 +1292,7 @@
+ 		memcpy(dest, data, len);
+ 		relay_flush(dev->relay_fwlog);
+ 	}
+-	spin_unlock_irqrestore(&lock, flags);
++	spin_unlock_irqrestore(&mt7915_fwlog_lock, flags);
+ }
+ 
+ void mt7915_debugfs_rx_fw_monitor(struct mt7915_dev *dev, const void *data, int len)
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -165,6 +165,14 @@
+ 		dev_err(mdev->dev, "Message %08x (seq %d) timeout\n",
+ 			cmd, seq);
+ 
++		/* openwrt-one-sdr: while a continuous IQ capture (func6) owns the WM,
++		 * it legitimately can't answer periodic/background MCU commands. Do NOT
++		 * reset the chip (that reloads firmware and aborts the stream at ~4 s);
++		 * just fail the timed-out command. Recovery re-enables once the capture
++		 * stops and iq_export is cleared. */
++		if (rcu_access_pointer(dev->iq_export))
++			return -ETIMEDOUT;
++
+ 		if (!test_and_set_bit(MT76_MCU_RESET, &dev->mphy.state)) {
+ 			dev->recovery.restart = true;
+ 			wake_up(&dev->mt76.mcu.wait);
+@@ -386,6 +394,11 @@
+ 
+ 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
+ 	switch (rxd->ext_eid) {
++	case 0x50: /* native spectrum capture */
++	case 0xf1: /* raw IQ diagnostic producer */
++		if (!skb_linearize(skb))
++			mt7915_debugfs_rx_fw_monitor(dev, skb->data, skb->len);
++		break;
+ 	case MCU_EXT_EVENT_THERMAL_PROTECT:
+ 		mt7915_mcu_rx_thermal_notify(dev, skb);
+ 		break;
+@@ -425,6 +438,9 @@
+ void mt7915_mcu_rx_event(struct mt7915_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt76_connac2_mcu_rxd *rxd;
++
++	if (mt7915_iq_rx(dev, skb))
++		return;
+ 
+ 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
+ 	if ((rxd->ext_eid == MCU_EXT_EVENT_THERMAL_PROTECT ||
+@@ -669,6 +685,14 @@
+ 	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
+ 	struct mt7915_dev *dev = phy->dev;
+ 	struct sk_buff *skb;
++
++	/* openwrt-one-sdr: while a continuous IQ capture owns the WM (func6), this
++	 * BSS_INFO_UPDATE (0x26) cannot be answered and times out; the timeout
++	 * stalls the MCU RX path that also carries the capture's 0xf1 events, so the
++	 * producer's DMA goes unconsumed and the capture pool overruns (~every
++	 * 150-200 s). The AP state is not needed during a capture; skip it. */
++	if (rcu_access_pointer(dev->iq_export))
++		return 0;
+ 
+ 	if (mvif->mt76.omac_idx >= REPEATER_BSSID_START) {
+ 		mt7915_mcu_muar_config(phy, vif, false, enable);
+@@ -2351,14 +2375,24 @@
+ 				 MCU_WA_PARAM_RED, enabled, 0);
+ }
+ 
++/* openwrt-one-sdr: boot the WM in ICAP capture mode. MT_SWDEF_MODE must be set
++ * BEFORE the firmware download (consumed at WM init); setting it live has no
++ * effect. insmod mt7915e.ko icap_boot_mode=1 to make the WM come up in ICAP
++ * mode so the internal IQ-capture datapath is available. */
++static int icap_boot_mode;
++module_param(icap_boot_mode, int, 0644);
++MODULE_PARM_DESC(icap_boot_mode, "0=normal, 1=ICAP, 2=spectrum WM boot mode (SWDEF)");
++
+ int mt7915_mcu_init_firmware(struct mt7915_dev *dev)
+ {
+ 	int ret;
+ 
+-	/* force firmware operation mode into normal state,
++	/* force firmware operation mode (normal, or ICAP/spectrum per module param),
+ 	 * which should be set before firmware download stage.
+ 	 */
+-	mt76_wr(dev, MT_SWDEF_MODE, MT_SWDEF_NORMAL_MODE);
++	mt76_wr(dev, MT_SWDEF_MODE,
++		icap_boot_mode == 1 ? MT_SWDEF_ICAP_MODE :
++		icap_boot_mode == 2 ? MT_SWDEF_SPECTRUM_MODE : MT_SWDEF_NORMAL_MODE);
+ 
+ 	ret = mt7915_driver_own(dev, 0);
+ 	if (ret)
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -301,6 +301,7 @@
+ 
+ 	struct dentry *debugfs_dir;
+ 	struct rchan *relay_fwlog;
++	struct mt7915_iq_export __rcu *iq_export;
+ 
+ 	void *cal;
+ 	u32 cur_prek_offset;
+@@ -593,6 +594,9 @@
+ int mt7915_mcu_muru_debug_get(struct mt7915_phy *phy);
+ int mt7915_mcu_wed_enable_rx_stats(struct mt7915_dev *dev);
+ int mt7915_init_debugfs(struct mt7915_phy *phy);
++int mt7915_tm_icap_prime(struct mt7915_dev *dev, u64 val);
++bool mt7915_iq_rx(struct mt7915_dev *dev, struct sk_buff *skb);
++void mt7915_iq_stop(struct mt7915_dev *dev);
+ void mt7915_debugfs_rx_fw_monitor(struct mt7915_dev *dev, const void *data, int len);
+ bool mt7915_debugfs_rx_log(struct mt7915_dev *dev, const void *data, int len);
+ #ifdef CONFIG_MAC80211_DEBUGFS
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1279,6 +1279,7 @@
+ 
+ void mt7915_unregister_device(struct mt7915_dev *dev)
+ {
++	mt7915_iq_stop(dev);
+ 	mt7915_unregister_ext_phy(dev);
+ 	mt7915_coredump_unregister(dev);
+ 	mt7915_unregister_thermal(&dev->phy);
+--- /dev/null
++++ b/mt7915/relay-committed.inc
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: ISC
++ * relay_reserve publishes offset before the producer copies bytes. The generic
++ * relay reader can therefore expose a partially written current subbuffer.
++ * Snapshot only flushed subbuffers under the writer lock, then copy without
++ * that lock. Unconsumed subbuffers cannot be reused by this non-overwrite relay.
++ * Use one reader; don't reset the relay concurrently with acquisition.
++ */
++static DEFINE_SPINLOCK(mt7915_fwlog_lock);
++static int mt7915_fwlog_open(struct inode *inode, struct file *file)
++{
++	return relay_file_operations.open(inode, file);
++}
++static int mt7915_fwlog_release(struct inode *inode, struct file *file)
++{
++	return relay_file_operations.release(inode, file);
++}
++static ssize_t mt7915_fwlog_read(struct file *file, char __user *user,
++			       size_t count, loff_t *pos)
++{
++	struct rchan_buf *buf = file->private_data;
++	size_t produced, consumed, available = 0, i;
++	unsigned long flags;
++
++	spin_lock_irqsave(&mt7915_fwlog_lock, flags);
++	produced = buf->subbufs_produced;
++	consumed = buf->subbufs_consumed;
++	if (produced - consumed > buf->chan->n_subbufs) {
++		spin_unlock_irqrestore(&mt7915_fwlog_lock, flags);
++		return -EOVERFLOW;
++	}
++	for (i = consumed; i != produced && available < count; i++)
++		available += buf->chan->subbuf_size -
++			buf->padding[i % buf->chan->n_subbufs];
++	if (available)
++		available -= buf->bytes_consumed;
++	spin_unlock_irqrestore(&mt7915_fwlog_lock, flags);
++	if (!available)
++		return -EAGAIN;
++	return relay_file_operations.read(file, user, min(count, available), pos);
++}
++static const struct file_operations mt7915_fwlog_fops = {
++	.owner = THIS_MODULE,
++	.open = mt7915_fwlog_open,
++	.release = mt7915_fwlog_release,
++	.read = mt7915_fwlog_read,
++	.llseek = no_llseek,
++};
+--- /dev/null
++++ b/mt7915/window.inc
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: ISC
++ * Included by mt7915/debugfs.c. Only reads the known native capture window.
++ * Retire native capture and clear ICAP_EN before taking a stable snapshot.
++ */
++static ssize_t mt7915_icap_window_read(struct file *file, char __user *user,
++				     size_t count, loff_t *ppos)
++{
++	struct mt7915_dev *dev = file->private_data;
++	void *buf;
++	u64 start;
++	ssize_t ret;
++
++	if (*ppos < 0 || *ppos >= 65536)
++		return 0;
++	count = min_t(size_t, count, 65536 - *ppos);
++	if ((*ppos | count) & 3)
++		return -EINVAL;
++	buf = kmalloc(count, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	start = ktime_get_ns();
++	mt7915_memcpy_fromio(dev, buf, 0x00400000 + *ppos, count);
++	dev_info(dev->mt76.dev, "icap window: %zu bytes in %llu ns\n",
++		 count, ktime_get_ns() - start);
++	ret = copy_to_user(user, buf, count) ? -EFAULT : count;
++	if (ret > 0)
++		*ppos += ret;
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations fops_icap_window = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = mt7915_icap_window_read,
++	.llseek = default_llseek,
++};
+--- /dev/null
++++ b/mt7915/udp-export.inc
+@@ -0,0 +1,372 @@
++/* SPDX-License-Identifier: ISC
++ * MT7981 IQ export: consume native DMA skbs before relay linearization/copying.
++ * A bounded skb queue feeds an Ethernet worker. Each worker reads every
++ * selected sample once into the final network skb.
++ *
++ * Output format is selected per run (optional 8th config token):
++ *   iqd1  (default) - 32-byte IQD1 header + CI8 payload (legacy host tools).
++ *   vrt8            - VITA 49 (VRT) Signal-Data, CI8 payload.
++ *   vrt16           - VITA 49 (VRT) Signal-Data, int16 payload carrying the
++ *                     full 14-bit capture resolution left-justified into 16
++ *                     bits; a periodic IF-Context packet announces RF
++ *                     frequency, sample rate and data format.
++ * A native sample word packs signed 14-bit I in bits [29:16] and 14-bit Q in
++ * bits [13:0]. CI8 keeps the top 8 bits of each; Ci16 left-justifies the 14.
++ * IQD1 header (32 bytes, little endian): magic, run, sequence, offset(u16),
++ * samples(u16), nominal rate, format(u16)=1(CI8), flags(u16), source, reserved.
++ */
++#include <linux/etherdevice.h>
++#include <linux/ip.h>
++#include <linux/inet.h>
++#include <linux/if_arp.h>
++#include <linux/udp.h>
++#include <linux/kthread.h>
++#include <linux/wait.h>
++#include <net/ip.h>
++#include <net/net_namespace.h>
++
++struct mt7915_iq_export {
++	struct net_device *netdev;
++	struct task_struct *task;
++	struct sk_buff_head queue;
++	wait_queue_head_t wait;
++	__be32 src, dst;
++	__be16 port;
++	u8 mac[ETH_ALEN];
++	u32 rate, run;
++	u64 freq;
++	u16 fmt;
++	u8 context_count;
++	u32 sig_ctr;
++	atomic64_t received, dropped, sent, tx_errors, tx_busy;
++};
++#define IQ_FMT_IQD1  0
++#define IQ_FMT_VRT8  1
++#define IQ_FMT_VRT16 2
++static DEFINE_MUTEX(mt7915_iq_config_lock);
++
++/* Build an Ethernet/IPv4/UDP skb with headers set; caller skb_put()s payload. */
++static struct sk_buff *mt7915_iq_skb(struct mt7915_iq_export *x,
++				     unsigned int payload, u16 ipid)
++{
++	const unsigned int size = ETH_HLEN + 20 + 8 + payload;
++	struct ethhdr *eth;
++	struct iphdr *ip;
++	struct udphdr *udp;
++	struct sk_buff *out = alloc_skb(LL_RESERVED_SPACE(x->netdev) + 6 + size, GFP_KERNEL);
++
++	if (!out)
++		return NULL;
++	/* Six bytes align IP to four and VRT sample pairs to eight bytes.
++	 * NET_IP_ALIGN is zero on arm64, so use explicit padding. */
++	skb_reserve(out, LL_RESERVED_SPACE(x->netdev) + 6);
++	eth = (void *)skb_put(out, ETH_HLEN);
++	skb_reset_mac_header(out);
++	ether_addr_copy(eth->h_dest, x->mac);
++	ether_addr_copy(eth->h_source, x->netdev->dev_addr);
++	eth->h_proto = htons(ETH_P_IP);
++	skb_set_network_header(out, out->len);
++	ip = (void *)skb_put(out, 20);
++	*ip = (struct iphdr){ .version=4, .ihl=5, .ttl=64, .protocol=IPPROTO_UDP,
++		.tot_len=htons(20+8+payload), .id=htons(ipid), .frag_off=htons(IP_DF),
++		.saddr=x->src, .daddr=x->dst };
++	ip_send_check(ip);
++	skb_set_transport_header(out, out->len);
++	udp = (void *)skb_put(out, 8);
++	*udp = (struct udphdr){ .source=x->port, .dest=x->port,
++		.len=htons(8+payload), .check=0 };
++	return out;
++}
++
++static void mt7915_iq_xmit(struct mt7915_iq_export *x, struct sk_buff *out)
++{
++	int ret;
++	u64 deadline = 0;
++	out->dev = x->netdev;
++	out->protocol = htons(ETH_P_IP);
++	out->ip_summed = CHECKSUM_NONE;
++	/* Match the reference SDR's direct submission path. Retry BUSY while we
++	 * still own the skb; completed/error returns have consumed it already. */
++	for (;;) {
++		ret = __dev_direct_xmit(out, 0);
++		if (dev_xmit_complete(ret)) break;
++		atomic64_inc(&x->tx_busy);
++		if (!deadline) deadline = ktime_get_ns() + 1000000;
++		if (kthread_should_stop() || ktime_get_ns() >= deadline) {
++			kfree_skb(out);
++			atomic64_inc(&x->tx_errors);
++			return;
++		}
++		cond_resched();
++	}
++	if (ret == NETDEV_TX_OK) atomic64_inc(&x->sent);
++	else atomic64_inc(&x->tx_errors);
++}
++
++/* VITA 49 IF-Context: RF reference frequency, sample rate, data format.
++ * Receivers block until they see this, then auto-detect the stream. */
++static void mt7915_iq_send_context(struct mt7915_iq_export *x, int bits, u16 ipid)
++{
++	struct sk_buff *cx = mt7915_iq_skb(x, 36, ipid);
++	u8 *q;
++	if (!cx) { atomic64_inc(&x->tx_errors); return; }
++	q = skb_put(cx, 36);
++	put_unaligned_be32((4u << 28) | ((x->context_count++ & 15u) << 16) | 9u, q);
++	put_unaligned_be32(1, q + 4);                        /* stream ID */
++	put_unaligned_be32((1u<<27)|(1u<<21)|(1u<<15), q+8); /* RF freq | rate | format */
++	put_unaligned_be64((s64)(x->freq << 20), q + 12);    /* Hz, 20-bit fraction */
++	put_unaligned_be64((s64)((u64)x->rate << 20), q + 20);
++	/* Complex signed samples: item width AND packing-field width. Both fields
++	 * encode width minus one; omitting packing width falsely declares 1 bit. */
++	put_unaligned_be32((1u << 29) | (((u32)bits - 1u) << 6) | ((u32)bits - 1u), q + 28);
++	put_unaligned_be32(0, q + 32);
++	mt7915_iq_xmit(x, cx);
++}
++
++/* Convert the selected RF path directly from skb fragments. Native buffers
++ * contain 2048 consecutive path0 words (CR10 64-to-128 packing enabled).
++ * Sequential mapping also works if a sample crosses a fragment boundary. */
++static int mt7915_iq_convert(struct sk_buff *in, struct skb_seq_state *st,
++                            unsigned offset, unsigned count, u8 *dst, int bits)
++{
++    while (count) {
++        const u8 *src;
++        unsigned available = skb_seq_read(offset, &src, st);
++        unsigned n = min(count, available / 4), i;
++        if (!n) {
++            u8 word[4];
++            u32 v;
++            if (skb_copy_bits(in, 44 + offset, word, 4)) return -EINVAL;
++            v = get_unaligned_le32(word);
++            if (bits == 16) { put_unaligned_be32((v << 2) & 0xfffcfffc, dst); dst += 4; }
++            else { *dst++ = v >> 22; *dst++ = v >> 6; }
++            offset += 4; count--; continue;
++        }
++        for (i = 0; i + 1 < n; i += 2, src += 8) {
++            u32 a = get_unaligned_le32(src), b = get_unaligned_le32(src + 4);
++            if (bits == 16) {
++                u64 pair = ((u64)a << 32) | b;
++                put_unaligned_be64((pair << 2) & 0xfffcfffcfffcfffcULL, dst);
++                dst += 8;
++            } else {
++                put_unaligned_le32(((a >> 22) & 0xff) | ((a << 2) & 0xff00) |
++                                  ((b >> 6) & 0xff0000) | ((b << 18) & 0xff000000), dst);
++                dst += 4;
++            }
++        }
++        if (i < n) {
++            u32 v = get_unaligned_le32(src);
++            if (bits == 16) { put_unaligned_be32((v << 2) & 0xfffcfffc, dst); dst += 4; }
++            else { *dst++ = v >> 22; *dst++ = v >> 6; }
++        }
++        offset += n * 4; count -= n;
++    }
++    return 0;
++}
++
++static int mt7915_iq_worker(void *arg)
++{
++	struct mt7915_iq_export *x = arg;
++	struct sk_buff *in;
++
++	while (!kthread_should_stop()) {
++		wait_event_interruptible(x->wait,
++			kthread_should_stop() || !skb_queue_empty(&x->queue));
++		if (kthread_should_stop())
++			break;
++		while ((in = skb_dequeue(&x->queue))) {
++			u32 seq, source;
++			u8 meta[8];
++			struct skb_seq_state seqst;
++			int half, convert_ret;
++			if (skb_copy_bits(in, 36, meta, sizeof(meta))) {
++				atomic64_inc(&x->dropped);
++				kfree_skb(in);
++				continue;
++			}
++			seq = get_unaligned_le32(meta);
++			source = get_unaligned_le32(meta + 4);
++			if (x->fmt == IQ_FMT_IQD1) {
++			for (half = 0; half < 4; half++) {
++				struct sk_buff *out;
++				u8 *h, *data;
++				const unsigned int payload = 32 + 1024;
++
++				out = mt7915_iq_skb(x, payload, seq*4+half);
++				if (!out) { atomic64_inc(&x->tx_errors); break; }
++				h = skb_put_zero(out, 32);
++				memcpy(h, "IQD1", 4);
++				put_unaligned_le32(x->run, h+4);
++				put_unaligned_le32(seq * 2 + half / 2, h+8);
++				put_unaligned_le16((half % 2)*512, h+12);
++				put_unaligned_le16(512, h+14);
++				put_unaligned_le32(x->rate, h+16);
++				put_unaligned_le16(1, h+20);
++				put_unaligned_le32(source, h+24);
++				data = skb_put(out, 1024);
++                skb_prepare_seq_read(in, 44, 44 + 8192, &seqst);
++                convert_ret = mt7915_iq_convert(in, &seqst, half * 2048, 512, data, 8);
++                skb_abort_seq_read(&seqst);
++                if (convert_ret) {
++                    kfree_skb(out); atomic64_inc(&x->dropped); break;
++                }
++				mt7915_iq_xmit(x, out);
++			}
++			} else {
++				int bits = (x->fmt == IQ_FMT_VRT16) ? 16 : 8;
++				int bps = (bits == 16) ? 4 : 2;
++				/* Six MTU-safe packets per packed path0 buffer at full resolution. */
++				int chunk = bits == 16 ? 360 : 512;
++				int nchunks = DIV_ROUND_UP(2048, chunk);
++				int c;
++				for (c = 0; c < nchunks; c++) {
++					struct sk_buff *out;
++					u8 *p, *d;
++					int nsamples = min(chunk, 2048 - c * chunk);
++					unsigned int payload = 8 + nsamples * bps;
++
++					if ((x->sig_ctr++ % 128) == 0)
++						mt7915_iq_send_context(x, bits, seq*8+c);
++					out = mt7915_iq_skb(x, payload, seq*8+c+4);
++					if (!out) { atomic64_inc(&x->tx_errors); break; }
++					p = skb_put(out, 8);
++					/* Preserve raw-source discontinuities in the VRT count. */
++					put_unaligned_be32((1u<<28) | (((seq*nchunks+c)&15)<<16)
++						| (2u + (u32)nsamples*bps/4), p); /* Signal-Data, w/ SID */
++					put_unaligned_be32(1, p + 4);          /* stream ID */
++					d = skb_put(out, nsamples * bps);
++                    skb_prepare_seq_read(in, 44, 44 + 8192, &seqst);
++                    convert_ret = mt7915_iq_convert(in, &seqst, c * chunk * 4, nsamples, d, bits);
++                    /* kmap_atomic mappings must end before xmit can reschedule. */
++                    skb_abort_seq_read(&seqst);
++                    if (convert_ret) {
++                        kfree_skb(out); atomic64_inc(&x->dropped); break;
++                    }
++					mt7915_iq_xmit(x, out);
++				}
++			}
++			kfree_skb(in);
++			cond_resched();
++			if (kthread_should_stop()) break;
++		}
++	}
++	return 0;
++}
++
++/* Takes ownership only when configured and the packet matches our exporter. */
++bool mt7915_iq_rx(struct mt7915_dev *dev, struct sk_buff *skb)
++{
++	struct mt7915_iq_export *x;
++	bool taken = false;
++	if (skb->len != 8240 || skb_headlen(skb) < 44 || skb->data[32] != 0xf1)
++		return false;
++	rcu_read_lock();
++	x = rcu_dereference(dev->iq_export);
++	if (x) {
++		taken = true;
++		atomic64_inc(&x->received);
++		if (skb_queue_len(&x->queue) >= 8192) {
++			atomic64_inc(&x->dropped);
++			dev_kfree_skb_any(skb);
++		} else {
++			skb_queue_tail(&x->queue, skb);
++			wake_up(&x->wait);
++		}
++	}
++	rcu_read_unlock();
++	return taken;
++}
++
++static void mt7915_iq_stop_locked(struct mt7915_dev *dev)
++{
++	struct mt7915_iq_export *x = rcu_dereference_protected(dev->iq_export,
++		lockdep_is_held(&mt7915_iq_config_lock));
++	if (!x) return;
++	RCU_INIT_POINTER(dev->iq_export, NULL);
++	synchronize_rcu();
++	kthread_stop(x->task);
++	skb_queue_purge(&x->queue);
++	dev_put(x->netdev);
++	kfree(x);
++}
++void mt7915_iq_stop(struct mt7915_dev *dev)
++{
++	mutex_lock(&mt7915_iq_config_lock);
++	mt7915_iq_stop_locked(dev);
++	mutex_unlock(&mt7915_iq_config_lock);
++}
++static ssize_t mt7915_iq_config_write(struct file *file, const char __user *user,
++				    size_t count, loff_t *pos)
++{
++	struct mt7915_dev *dev=file->private_data;
++	struct mt7915_iq_export *x;
++	char text[160], iface[IFNAMSIZ], src[16], dst[16], mac[18], fmt[8]="";
++	unsigned int port, rate;
++	unsigned long long freq=0;
++	int ret=-EINVAL, nf;
++	if (!count || count >= sizeof(text)) return -EINVAL;
++	if (copy_from_user(text,user,count)) return -EFAULT;
++	text[count]=0;
++	mutex_lock(&mt7915_iq_config_lock);
++	if (sysfs_streq(text,"stop")) {
++		mt7915_iq_stop_locked(dev); ret=count; goto out;
++	}
++	nf = sscanf(text,"%15s %15s %15s %17s %u %u %llu %7s",
++		    iface,src,dst,mac,&port,&rate,&freq,fmt);
++	if (nf<6 || !port || port>65535 || (rate!=20000000 && rate!=40000000 && rate!=80000000)) goto out;
++	if (rcu_access_pointer(dev->iq_export)) { ret=-EBUSY; goto out; }
++	x=kzalloc(sizeof(*x),GFP_KERNEL);
++	if (!x) { ret=-ENOMEM; goto out; }
++	if (!in4_pton(src,-1,(u8 *)&x->src,-1,NULL) ||
++	    !in4_pton(dst,-1,(u8 *)&x->dst,-1,NULL) ||
++	    !mac_pton(mac,x->mac) || !is_valid_ether_addr(x->mac)) goto free;
++	x->fmt = IQ_FMT_IQD1;
++	if (nf>=8) {
++		if (!strcmp(fmt,"vrt16")) x->fmt=IQ_FMT_VRT16;
++		else if (!strcmp(fmt,"vrt8")) x->fmt=IQ_FMT_VRT8;
++		else if (strcmp(fmt,"iqd1")) goto free;
++	}
++	x->freq = (nf>=7 && freq) ? freq : 2437000000ULL;
++	x->netdev=dev_get_by_name(&init_net,iface);
++	if (!x->netdev) { ret=-ENODEV; goto free; }
++	if (!netif_running(x->netdev) || x->netdev->type!=ARPHRD_ETHER ||
++	    x->netdev->mtu < (x->fmt==IQ_FMT_VRT16 ? 1476 : 1084)) goto put;
++	x->port=htons(port); x->rate=rate; x->run=(u32)ktime_get_ns();
++	skb_queue_head_init(&x->queue); init_waitqueue_head(&x->wait);
++	x->task=kthread_create(mt7915_iq_worker,x,"iq-udp");
++	if (IS_ERR(x->task)) { ret=PTR_ERR(x->task); goto put; }
++	if (cpu_online(1)) kthread_bind(x->task,1);
++	set_user_nice(x->task, -20);
++	rcu_assign_pointer(dev->iq_export,x);
++	wake_up_process(x->task);
++	ret=count; goto out;
++put:
++	dev_put(x->netdev);
++free:
++	kfree(x);
++out:
++	mutex_unlock(&mt7915_iq_config_lock);
++	return ret;
++}
++static ssize_t mt7915_iq_config_read(struct file *file,char __user *user,
++				   size_t count,loff_t *pos)
++{
++	struct mt7915_dev *dev=file->private_data;
++	struct mt7915_iq_export *x;
++	char text[256]; int n;
++	mutex_lock(&mt7915_iq_config_lock);
++	x=rcu_dereference_protected(dev->iq_export,lockdep_is_held(&mt7915_iq_config_lock));
++	if (!x) n=scnprintf(text,sizeof(text),"stopped\n");
++	else n=scnprintf(text,sizeof(text),"run=%u fmt=%s freq=%llu rate=%u received=%lld dropped=%lld sent=%lld tx_errors=%lld queued=%u rx_pid=%d tx_busy=%lld\n",
++		x->run,x->fmt==IQ_FMT_VRT16?"vrt16":x->fmt==IQ_FMT_VRT8?"vrt8":"iqd1",
++		x->freq,x->rate,atomic64_read(&x->received),atomic64_read(&x->dropped),
++		atomic64_read(&x->sent),atomic64_read(&x->tx_errors),skb_queue_len(&x->queue),
++		dev->mt76.napi[MT_RXQ_MCU].thread ? task_pid_nr(dev->mt76.napi[MT_RXQ_MCU].thread) : 0,
++		atomic64_read(&x->tx_busy));
++	mutex_unlock(&mt7915_iq_config_lock);
++	return simple_read_from_buffer(user,count,pos,text,n);
++}
++static const struct file_operations mt7915_iq_config_fops={
++	.owner=THIS_MODULE,.open=simple_open,.read=mt7915_iq_config_read,
++	.write=mt7915_iq_config_write,.llseek=default_llseek,
++};
