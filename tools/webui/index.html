@@ -1,0 +1,234 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenWrt One SDR</title>
+<style>
+  :root {
+    --bg: #0b0e13; --panel: #131820; --ink: #e6ecf4; --muted: #8592a4;
+    --line: #222c3a; --p0: #3fc7a8; --p1: #f0a848; --hold: #e0623a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f3f5f8; --panel: #fff; --ink: #141922; --muted: #5a6677;
+      --line: #d9e0ea; --p0: #128a70; --p1: #b06c10; --hold: #c23a16;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--ink);
+         font: 13px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+  h1 { font-size: 17px; margin: 0; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .note { color: var(--muted); font-size: 11px; margin: 0 0 12px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-bottom: 12px; }
+  .bar label { color: var(--muted); }
+  select, button { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+                   border-radius: 6px; padding: 4px 8px; font: inherit; }
+  .stats { display: flex; flex-wrap: wrap; gap: 16px; }
+  .stats b { color: var(--ink); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+  .panel h2 { margin: 0 0 6px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .grid { display: grid; grid-template-columns: 3fr 1fr; gap: 12px; }
+  .wide { grid-column: 1 / -1; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  canvas { width: 100%; display: block; border-radius: 6px; background: var(--bg); }
+  .live { color: var(--p0); } .err { color: var(--hold); }
+  .key span { margin-right: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OpenWrt One SDR</h1>
+  <span class="sub" id="where">MT7981 + MT7976 · native ICAP capture</span>
+  <span id="status" class="sub">connecting…</span>
+</header>
+<p class="note">Gapped live view: each frame is one ~8192-sample snapshot per antenna path (~6/s).
+WiFi is bursty, so the default trace is the 95th percentile of recent frames — packets show as
+~17&nbsp;MHz humps with a notch at each AP's centre (the OFDM null subcarrier). The spike at the exact
+centre is the receiver's own DC/LO leakage. Frequency axis (40&nbsp;MSps) was validated against known channel centres.</p>
+
+<div class="bar">
+  <span class="stats" id="stats"></span>
+  <label>trace <select id="trace">
+    <option value="burst" selected>burst (95th pct, last 30 frames)</option>
+    <option value="avg">average</option>
+    <option value="latest">latest frame</option></select></label>
+  <label><input type="checkbox" id="showaps" checked> AP markers</label>
+  <label>show <select id="paths"><option value="both" selected>both paths</option>
+    <option value="0">path 0</option><option value="1">path 1</option></select></label>
+  <button id="hold">reset peak hold</button>
+  <button id="pause">pause</button>
+</div>
+
+<div class="grid">
+  <div class="panel wide">
+    <h2>Spectrum (dBFS)</h2>
+    <div class="key sub"><span style="color:var(--p0)">■ path 0</span><span style="color:var(--p1)">■ path 1</span><span style="color:var(--hold)">— peak hold</span></div>
+    <canvas id="spec" width="1200" height="280"></canvas>
+  </div>
+  <div class="panel">
+    <h2>Waterfall (path 0)</h2>
+    <canvas id="wf" width="1200" height="300"></canvas>
+  </div>
+  <div class="panel">
+    <h2>Constellation (path 0)</h2>
+    <canvas id="iq" width="300" height="300"></canvas>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const css = v => getComputedStyle(document.body).getPropertyValue(v).trim();
+let lastSeq = 0, avg0 = null, avg1 = null, hold = null, paused = false;
+let floorDb = -110, topDb = -20;
+const RING = 30; let ring0 = [], ring1 = [];
+
+function pct(ring, q) {                    // per-bin percentile across recent frames
+  const n = ring[0].length, out = new Array(n), col = new Array(ring.length);
+  const k = Math.min(ring.length - 1, Math.round(q * (ring.length - 1)));
+  for (let i = 0; i < n; i++) {
+    for (let r = 0; r < ring.length; r++) col[r] = ring[r][i];
+    col.sort((a, b) => a - b); out[i] = col[k];
+  }
+  return out;
+}
+
+function drawAPs(g, f, W) {
+  if (!$("showaps").checked || !f.aps || !f.centre_hz) return;
+  const lo = f.centre_hz - f.fs_hz / 2, hi = f.centre_hz + f.fs_hz / 2;
+  g.font = "11px monospace"; let row = 0;
+  for (const ap of f.aps) {
+    if (ap.freq < lo || ap.freq > hi) continue;
+    const x = (ap.freq - lo) / f.fs_hz * W;
+    g.strokeStyle = css("--muted"); g.setLineDash([4, 4]);
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, c_spec_h()); g.stroke(); g.setLineDash([]);
+    g.fillStyle = css("--ink");
+    const label = `${ap.ssid} ${ap.dbm.toFixed(0)} dBm`;
+    g.fillText(label, Math.min(Math.max(2, x + 4), W - g.measureText(label).width - 2), 14 + 13 * (row++ % 3));
+  }
+}
+function c_spec_h() { return $("spec").height; }
+
+function fmtMHz(hz) { return (hz / 1e6).toFixed(1); }
+
+function ema(prev, cur, a) {
+  if (!prev || prev.length !== cur.length || a >= 1) return cur.slice();
+  return prev.map((p, i) => p + a * (cur[i] - p));
+}
+
+function scaleRange(arrs) {
+  let lo = Infinity, hi = -Infinity;
+  for (const a of arrs) for (const v of a) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  // slow-moving display range so the plot does not jump every frame
+  floorDb += 0.1 * ((lo - 5) - floorDb);
+  topDb   += 0.1 * ((hi + 5) - topDb);
+  if (topDb - floorDb < 20) topDb = floorDb + 20;
+}
+
+function drawSpectrum(f, t0, t1) {
+  const c = $("spec"), g = c.getContext("2d"), W = c.width, H = c.height;
+  const show = $("paths").value;
+  const series = [];
+  if (show !== "1") series.push([t0, css("--p0")]);
+  if (show !== "0") series.push([t1, css("--p1")]);
+  scaleRange(series.map(s => s[0]));
+  g.clearRect(0, 0, W, H);
+  g.strokeStyle = css("--line"); g.lineWidth = 1; g.font = "12px monospace"; g.fillStyle = css("--muted");
+  for (let i = 0; i <= 8; i++) {           // frequency grid
+    const x = i / 8 * W; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke();
+    const hz = f.centre_hz + (i / 8 - 0.5) * f.fs_hz;
+    if (f.centre_hz) g.fillText(fmtMHz(hz), Math.min(x + 3, W - 52), H - 4);
+  }
+  const step = 10;
+  for (let d = Math.ceil(floorDb / step) * step; d <= topDb; d += step) {   // level grid
+    const y = H - (d - floorDb) / (topDb - floorDb) * H;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); g.fillText(d + " dB", 4, y - 2);
+  }
+  const line = (arr, col, w) => {
+    g.strokeStyle = col; g.lineWidth = w; g.beginPath();
+    arr.forEach((v, i) => {
+      const x = i / (arr.length - 1) * W, y = H - (v - floorDb) / (topDb - floorDb) * H;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.stroke();
+  };
+  if (hold) line(hold, css("--hold"), 1);
+  for (const [arr, col] of series) line(arr, col, 1.5);
+  drawAPs(g, f, W);
+}
+
+function colour(t) {                         // dark blue -> teal -> yellow
+  t = Math.max(0, Math.min(1, t));
+  const r = Math.round(255 * Math.min(1, Math.max(0, 1.6 * t - 0.6)));
+  const gg = Math.round(255 * Math.min(1, 1.3 * t));
+  const b = Math.round(255 * Math.max(0, 0.55 - 0.6 * t) + 60 * (1 - t));
+  return [r, gg, b];
+}
+
+function drawWaterfall(row) {
+  const c = $("wf"), g = c.getContext("2d"), W = c.width, H = c.height;
+  g.drawImage(c, 0, 0, W, H - 2, 0, 2, W, H - 2);     // scroll down 2px
+  const img = g.createImageData(W, 2);
+  for (let x = 0; x < W; x++) {
+    const v = row[Math.floor(x / W * row.length)];
+    const [r, gg, b] = colour((v - floorDb) / (topDb - floorDb));
+    for (let y = 0; y < 2; y++) { const k = (y * W + x) * 4; img.data[k] = r; img.data[k+1] = gg; img.data[k+2] = b; img.data[k+3] = 255; }
+  }
+  g.putImageData(img, 0, 0);
+}
+
+function drawIQ(iq) {
+  const c = $("iq"), g = c.getContext("2d"), W = c.width, H = c.height;
+  g.clearRect(0, 0, W, H);
+  g.strokeStyle = css("--line"); g.beginPath();
+  g.moveTo(W / 2, 0); g.lineTo(W / 2, H); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke();
+  let m = 1e-6; for (const v of iq) m = Math.max(m, Math.abs(v));
+  const s = (W / 2 - 8) / m;
+  g.fillStyle = css("--p0");
+  for (let i = 0; i < iq.length; i += 2) g.fillRect(W / 2 + iq[i] * s, H / 2 - iq[i + 1] * s, 2, 2);
+  g.fillStyle = css("--muted"); g.font = "11px monospace";
+  g.fillText("±" + (m * 8192).toFixed(0) + " counts", 6, 14);
+}
+
+async function tick() {
+  if (paused) return;
+  try {
+    const f = await (await fetch("/api/latest")).json();
+    $("status").textContent = f.status + (f.seq ? "" : " (waiting for first frame)");
+    $("status").className = "sub " + (f.status === "streaming" ? "live" : (f.status.startsWith("error") ? "err" : ""));
+    if (!f.seq || f.seq === lastSeq) return;
+    if (lastSeq && f.centre_hz && drawSpectrum.centre && f.centre_hz !== drawSpectrum.centre) {
+      ring0 = []; ring1 = []; avg0 = avg1 = hold = null;      // retuned: drop old history
+    }
+    drawSpectrum.centre = f.centre_hz;
+    lastSeq = f.seq;
+    avg0 = ema(avg0, f.psd0, 0.2); avg1 = ema(avg1, f.psd1, 0.2);
+    ring0.push(f.psd0); ring1.push(f.psd1);
+    if (ring0.length > RING) { ring0.shift(); ring1.shift(); }
+    const mode = $("trace").value;
+    const t0 = mode === "burst" ? pct(ring0, 0.95) : mode === "avg" ? avg0 : f.psd0;
+    const t1 = mode === "burst" ? pct(ring1, 0.95) : mode === "avg" ? avg1 : f.psd1;
+    const cur = $("paths").value === "1" ? t1 : t0;
+    hold = hold ? hold.map((v, i) => Math.max(v, cur[i])) : cur.slice();
+    if (f.centre_hz) $("where").textContent = `centre ${fmtMHz(f.centre_hz)} MHz · span ${fmtMHz(f.fs_hz)} MHz (assumed) · FFT ${f.fft}`;
+    $("stats").innerHTML = `<span>frame <b>${f.seq}</b></span><span><b>${f.fps}</b> fps</span>` +
+      `<span>p0 <b>${f.rms0_dbfs}</b> dBFS</span><span>p1 <b>${f.rms1_dbfs}</b> dBFS</span>` +
+      `<span>p0↔p1 corr <b>${f.xcorr}</b></span>`;
+    drawSpectrum(f, t0, t1);
+    drawWaterfall($("paths").value === "1" ? f.psd1 : f.psd0);
+    drawIQ(f.iq);
+  } catch (e) {
+    $("status").textContent = "server unreachable: " + e.message; $("status").className = "sub err";
+  }
+}
+
+$("hold").onclick = () => { hold = null; };
+$("pause").onclick = e => { paused = !paused; e.target.textContent = paused ? "resume" : "pause"; };
+setInterval(tick, 100);
+</script>
+</body>
+</html>
