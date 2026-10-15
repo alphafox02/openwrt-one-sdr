@@ -1,0 +1,134 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- Spectrum viewer from W1700K-SDR (c) 2026 h0m3us3r; title adapted for openwrt-one-sdr. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>OpenWrt One SDR</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="bar">
+  <button id="menu" class="icon" type="button" aria-label="Show or hide the controls" aria-expanded="true">&#9776;</button>
+  <button id="run" class="run" type="button" aria-label="Start streaming">&#9654;</button>
+  <div class="tuning">
+    <div id="frequency" class="frequency" tabindex="0" role="group"
+         title="Centre frequency: wheel or click a digit to step it, type to enter one"
+         aria-label="Centre frequency"></div>
+    <input id="frequency-entry" class="frequency-entry" hidden inputmode="decimal" spellcheck="false"
+           aria-label="Centre frequency, MHz">
+    <div id="span" class="span"></div>
+  </div>
+  <div class="pills">
+    <span id="pill-link" class="pill" title="Connection to the server">connecting</span>
+    <span id="pill-state" class="pill" title="Stream">&hellip;</span>
+    <span id="pill-control" class="pill" title="Receiver control">&hellip;</span>
+    <span id="pill-ring" class="pill" title="Samples received and not yet transformed"><span class="meter"><span id="ring-mini"></span></span><span id="ring-mini-text">ring</span></span>
+    <span id="pill-errors" class="pill" title="Slices lost, late, doubled or malformed">&hellip;</span>
+  </div>
+</header>
+
+<main>
+  <aside id="sidebar" aria-label="Controls">
+    <details id="panel-receiver" data-panel="receiver">
+      <summary>Receiver</summary>
+      <div id="busy" class="busy" hidden>
+        <div class="gauge"><div id="busy-fill"></div></div>
+        <p class="note" id="busy-text"></p>
+      </div>
+      <div class="row"><label for="lo" title="Any frequency in the band's range, on the synthesizer's grid (a few Hz)">LO</label><input id="lo" type="text" inputmode="decimal" spellcheck="false"><span class="unit">MHz</span></div>
+      <p class="note" id="lo-note"></p>
+      <h3>Band</h3>
+      <div class="row"><label for="band">Band</label><select id="band"></select></div>
+      <div class="row"><span class="label" title="Complex 14-bit IQ samples per second, independent of the LO and the filter">Sample rate</span>
+        <div class="segmented tight" id="rate"><button type="button" data-v="40">40</button><button type="button" data-v="80">80</button><button type="button" data-v="160">160</button><button type="button" data-v="320">320</button><button type="button" data-v="640/2" title="Band 2: captured at 640 Msps, every other sample streamed (320 Msps). Flat to about ±155 MHz, but signals 160–320 MHz from the LO fold in">640/2</button></div><span class="unit">Msps</span></div>
+      <div class="row buttons"><button id="configure" type="button">Apply</button></div>
+      <p class="note" id="configure-note"></p>
+      <h3>Front end</h3>
+      <div class="row"><span class="label" title="The analog filter's width">Filter</span>
+        <div class="segmented tight" id="filter"><button type="button" data-v="20">20</button><button type="button" data-v="40">40</button><button type="button" data-v="80">80</button><button type="button" data-v="160">160</button><button type="button" data-v="320">320</button></div><span class="unit">MHz</span></div>
+      <div class="row check"><label title="Divides the decimation's roll-off out of the IQ stream itself (w1700k-stream), for every consumer; it applies where the filter is as wide as the sample rate, and not at 640/2, which is flat already"><input id="flatten" type="checkbox"> Flatten the passband</label></div>
+      <p class="note" id="flatten-note"></p>
+      <div class="row check"><label><input id="agc" type="checkbox"> Automatic gain control</label></div>
+      <div class="row slider"><label for="lna" title="Low-noise amplifier, about 6 dB a step">LNA</label><input id="lna" type="range" min="0" max="4" step="1" value="2"><output for="lna" class="wide"></output></div>
+      <div class="row slider"><label for="lpf" title="Baseband amplifier, about 2 dB a step">Baseband</label><input id="lpf" type="range" min="0" max="9" step="1" value="5"><output for="lpf" class="wide"></output></div>
+      <p class="note" id="receiver-note"></p>
+    </details>
+
+    <details id="panel-fft" data-panel="fft">
+      <summary>FFT</summary>
+      <div class="row"><label for="fft-size">Resolution</label><select id="fft-size"></select></div>
+      <div class="row"><label for="fft-window">Window</label><select id="fft-window"></select></div>
+      <div class="row slider"><label for="fft-rate">Speed</label><input id="fft-rate" type="range" min="1" max="100"><output for="fft-rate"></output></div>
+      <div class="row slider"><label for="fft-averaging">Averaging</label><input id="fft-averaging" type="range" min="0" max="13"><output for="fft-averaging"></output></div>
+      <div class="row"><span class="label">Detector</span>
+        <div class="segmented" id="fft-detector"><button type="button" data-v="average">Average</button><button type="button" data-v="peak">Peak</button></div></div>
+      <div class="row check"><label><input id="fft-dc" type="checkbox"> Remove DC</label></div>
+      <p class="note" id="fft-note"></p>
+    </details>
+
+    <details id="panel-display" data-panel="display">
+      <summary>Display</summary>
+      <div class="row slider"><label for="s-attack">Spectrum attack</label><input id="s-attack" type="range" min="0" max="1" step="0.05"><output for="s-attack"></output></div>
+      <div class="row slider"><label for="s-decay">Spectrum decay</label><input id="s-decay" type="range" min="0" max="1" step="0.05"><output for="s-decay"></output></div>
+      <div class="row slider"><label for="w-attack">Waterfall attack</label><input id="w-attack" type="range" min="0" max="1" step="0.05"><output for="w-attack"></output></div>
+      <div class="row slider"><label for="w-decay">Waterfall decay</label><input id="w-decay" type="range" min="0" max="1" step="0.05"><output for="w-decay"></output></div>
+      <div class="row"><label for="palette">Colors</label><select id="palette"></select></div>
+      <div id="palette-swatch" class="swatch" aria-hidden="true"></div>
+      <div class="row check"><label><input id="fill" type="checkbox"> Fill under the spectrum</label></div>
+      <div class="row check"><label><input id="peak-hold" type="checkbox"> Peak hold</label>
+        <button id="peak-reset" type="button" class="small">Reset</button></div>
+      <div class="row buttons"><button id="auto-levels" type="button">Auto levels</button><button id="clear-waterfall" type="button">Clear waterfall</button></div>
+      <p class="note">Wheel or pinch to zoom, drag to pan, click to place a marker (right-click removes it), double-click to tune there. Keys: + &minus; 0 &larr; &rarr;.</p>
+    </details>
+
+    <details id="panel-stream" data-panel="stream">
+      <summary>Stream</summary>
+      <h3>Sample ring <span class="hint">(this server)</span></h3>
+      <div class="gauge" aria-hidden="true"><div id="ring-fill"></div><div id="ring-peak"></div></div>
+      <dl class="stats" id="ring-stats"></dl>
+      <h3>Throughput</h3>
+      <dl class="stats" id="rate-stats"></dl>
+      <h3>Counters <span class="hint">(since start)</span></h3>
+      <table class="counters" id="counters"></table>
+      <h3>Source</h3>
+      <dl class="stats" id="devices"></dl>
+    </details>
+
+    <details id="panel-link" data-panel="link">
+      <summary>Connection</summary>
+      <dl class="stats" id="link-stats"></dl>
+      <div class="row slider"><label for="max-fps">Max frames/s</label><input id="max-fps" type="range" min="0" max="100"><output for="max-fps"></output></div>
+      <div class="row"><label for="max-kbps">Bandwidth</label>
+        <select id="max-kbps"><option value="0">Unlimited</option><option value="8000">8 Mbit/s</option><option value="2000">2 Mbit/s</option>
+          <option value="1000">1 Mbit/s</option><option value="512">512 kbit/s</option><option value="256">256 kbit/s</option>
+          <option value="128">128 kbit/s</option><option value="64">64 kbit/s</option></select></div>
+      <div class="row"><label for="max-bins">Resolution</label>
+        <select id="max-bins"><option value="-1">Auto</option><option value="0">Screen</option><option value="2048">2048 bins</option><option value="1024">1024 bins</option>
+          <option value="512">512 bins</option><option value="256">256 bins</option></select></div>
+      <p class="note">One browser at a time: opening the page elsewhere takes over from this one. Frames the link cannot carry are merged into the next, so short signals still show.</p>
+    </details>
+  </aside>
+
+  <section class="plot">
+    <div id="canvases" class="canvases">
+      <canvas id="gl"></canvas>
+      <canvas id="overlay"></canvas>
+      <div id="splitter" class="splitter" role="separator" aria-label="Resize spectrum and waterfall"></div>
+      <div id="message" class="message" hidden><p id="message-text"></p><button id="take-over" type="button" hidden>Use this browser</button></div>
+    </div>
+    <div class="sliders">
+      <label>Zoom<input id="zoom" class="vertical" type="range" min="0" max="1000" value="0"></label>
+      <label>Contrast<input id="contrast" class="vertical" type="range" min="-50" max="50" value="0"></label>
+      <label>Range<input id="range" class="vertical" type="range" min="10" max="200" value="80"></label>
+      <label>Offset<input id="offset" class="vertical" type="range" min="-160" max="20" value="-20"></label>
+    </div>
+  </section>
+</main>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>
