@@ -47,8 +47,10 @@ After stock restoration, disable both services:
 
 Keep the original S01 firmware and S02 driver guards enabled. No `rmmod` or
 `insmod` fallback is attempted: previous live reloads have wedged this board.
-Offline mocks verify selection, fallback and stop ordering; actual boot order,
-power-loss recovery and sustained capture remain untested with this revision.
+Offline mocks verify selection, fallback and stop ordering. Physical cold-boot
+recovery was validated as described above; the deployment-to-reboot-to-capture
+chain was also exercised on hardware. HE40 capture on both bands was confirmed
+in bounded on-hardware tests.
 
 ## Network and access (the 2.5 GbE is a WAN port)
 

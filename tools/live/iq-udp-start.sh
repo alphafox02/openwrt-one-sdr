@@ -26,13 +26,23 @@ kb 0; sw 4 1; sw 16 2113536; sw 20 4096; sw 24 4096; sw 40 "$band"; sw 44 "$bw";
 kb 0x1400000000000000
 sleep 1
 native_retire "$band"
-# Select the first two lane words (path0 t,t+1) and pack consecutive samples.
+# Pack the first two lane words. On 5 GHz these are successive path0
+# samples; on the tested 2.4 GHz HE40 profile they alternate RF paths.
 # Stock firmware only sets packer bits; never inherit a previous capture's mode.
 cur=$(rr 0x800230b8)
 wr 0x800230b8 "$(printf '0x%x' "$(( (cur & ~0xf0000) | 0x10000 ))")"
 [ "$(( $(rr 0x800230b8) & 0xf0000 ))" -eq 65536 ] || exit 1
 wr 0xe009b800 0
 wr 0xe009b804 0
+if [ "$band" = 0 ]; then stride=8; else stride=4; fi
+echo "$iface $src $dst $mac $port $rate $freq $fmt $stride" > "$D/iq_udp"
+# Older drivers silently ignore a ninth token. Verify support before starting
+# the producer so an old module cannot emit mixed lanes with plausible metadata.
+if ! grep -q " stride=$stride " "$D/iq_udp"; then
+    echo stop > "$D/iq_udp"
+    echo 'Exporter lacks verified native-stride support; install the matching driver' >&2
+    exit 1
+fi
 # Put the MAC in receive-only mode on both bands (ARB_SCR TX_DISABLE, bit 8): the
 # radio keeps receiving to feed the capture, but never transmits, so beacons and
 # probe responses do not contend with the capture drain. Receive-thread
@@ -41,7 +51,6 @@ for arb in 0x820e3000 0x820f3000; do
 	cur=$(rr "$arb") || continue
 	wr "$arb" "$(printf '0x%x' "$(( cur | 0x100 ))")"
 done
-echo "$iface $src $dst $mac $port $rate $freq $fmt" > "$D/iq_udp"
 # Synchronous 115200-baud console output can block RX longer than the pool.
 # Preserve all messages in dmesg/syslog; suppress ordinary console output only.
 cat /proc/sys/kernel/printk > /tmp/iq-printk.saved

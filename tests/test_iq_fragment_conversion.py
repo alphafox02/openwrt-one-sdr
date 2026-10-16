@@ -32,24 +32,25 @@ int main(void) {
  struct sk_buff skb; struct skb_seq_state st={.skb=&skb};
  u8 out[8192], expected[8192];
  for(unsigned i=0;i<sizeof(skb.data);i++) skb.data[i]=rand();
+ for(unsigned stride=4;stride<=8;stride+=4)
  for(int bits=8;bits<=16;bits+=8) {
   unsigned bps=bits/4;
-  for(unsigned i=0;i<2048;i++) {
-   u32 v=get_unaligned_le32(skb.data+44+i*4);
+  for(unsigned i=0;i<8192/stride;i++) {
+   u32 v=get_unaligned_le32(skb.data+44+i*stride);
    if(bits==8) {expected[i*2]=v>>22;expected[i*2+1]=v>>6;}
    else put_unaligned_be32((v<<2)&0xfffcfffc,expected+i*4);
   }
   for(st.split=1;st.split<3000;st.split++) {
    memset(out,0,sizeof(out));
-   for(unsigned i=0;i<2048;) {
-    unsigned n=min(bits==16?360u:720u,2048-i);
-    if(mt7915_iq_convert(&skb,&st,i*4,n,out+i*bps,bits)) return 1;
+   for(unsigned i=0;i<8192/stride;) {
+    unsigned n=min(bits==16?360u:720u,8192/stride-i);
+    if(mt7915_iq_convert(&skb,&st,i*stride,n,out+i*bps,bits,stride)) return 1;
     i+=n;
    }
-   if(memcmp(out,expected,2048*bps)) {fprintf(stderr,"bad split %u bits %d\n",st.split,bits);return 2;}
+   if(memcmp(out,expected,8192/stride*bps)) {fprintf(stderr,"bad split %u bits %d\n",st.split,bits);return 2;}
   }
  }
- puts("fragment conversion: both formats, 2999 fragment sizes each passed");
+ puts("fragment conversion: both formats and strides, 2999 fragment sizes each passed");
 }
 '''
 with tempfile.TemporaryDirectory() as td:

@@ -11,9 +11,9 @@
 # (vita49-control, :4991) remains the control path for other SoapySDR/VITA 49.2
 # applications; this adapter is specific to the vendored viewer's protocol.
 #
-# Tuning snaps to the nearest supported Wi-Fi channel centre (the stock Wi-Fi
-# stack tunes on the channel grid, not arbitrary Hz). The 40 MHz capture window
-# is wider than the channel spacing, so any requested frequency lands inside it.
+# Tuning snaps to the nearest supported HE40 block centre. The stock Wi-Fi
+# stack selects a primary channel; the radio helper verifies the block centre
+# and width. Requests outside the supported ranges are clamped to an endpoint.
 # See docs/control-plane.md and the limitations in the top README.
 #
 # Run the viewer with:
@@ -63,14 +63,13 @@ def kv(text, key):
 
 
 def snap(hz):
-    """Nearest supported channel centre: 2.4 GHz channels 1..13 (5 MHz steps),
-    5 GHz channels 36/40/44/48 (U-NII-1, 20 MHz steps)."""
+    """Nearest supported HE40 block centre, distinct from the primary channel."""
     hz = int(hz)
     if hz < 3_700_000_000:
-        ch = max(0, min(12, round((hz - 2_412_000_000) / 5_000_000)))
-        return 2_412_000_000 + ch * 5_000_000
-    idx = max(0, min(3, round((hz - 5_180_000_000) / 20_000_000)))
-    return 5_180_000_000 + idx * 20_000_000
+        idx = max(0, min(8, round((hz - 2_422_000_000) / 5_000_000)))
+        return 2_422_000_000 + idx * 5_000_000
+    idx = max(0, min(1, round((hz - 5_190_000_000) / 40_000_000)))
+    return 5_190_000_000 + idx * 40_000_000
 
 
 def send(obj):
@@ -88,7 +87,7 @@ def state():
                    "sample_rate": sample_rate, "center_hz": lo_hz},
         "rf": {"lo_hz": lo_hz, "agc": None, "lna": None, "lpf": None,
                "filter_mhz": rf_width / 1e6 if rf_width else None,
-               "lo_range_hz": [2412000000, 5240000000]},
+               "lo_range_hz": [2422000000, 5230000000]},
         "error": None,
     }
 
@@ -107,7 +106,8 @@ def refresh_profile():
     lo_hz = int(kv(reply, "freq"))
     sample_rate = int(kv(reply, "rate"))
     band = int(kv(reply, "band"))
-    rf_width = 20_000_000
+    width = kv(reply, "bandwidth")
+    rf_width = int(width) if width is not None else None
 
 
 def do_start():

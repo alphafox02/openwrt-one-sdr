@@ -24,7 +24,7 @@ VITA 49 stream into the format it reads.
   <img src="docs/media/openwrt-one-sdr.gif" alt="OpenWrt One SDR — live 2.4 GHz capture in the spectrum viewer" width="640">
 </p>
 
-<p align="center"><em>The OpenWrt One capturing a live ~20 MHz slice of the 2.4 GHz band at 40 Msps.
+<p align="center"><em>An earlier HE20 capture: the OpenWrt One receiving a live ~20 MHz slice of the 2.4 GHz band at 40 Msps.
 The MT7981 radio streams 14-bit IQ as VITA 49 over the 2.5 GbE port to a Linux host, where the vendored
 viewer renders the live spectrum (upper trace) and waterfall (lower panel) in the browser. The moving
 energy is real Wi-Fi traffic in the local environment.</em></p>
@@ -33,49 +33,51 @@ energy is real Wi-Fi traffic in the local environment.</em></p>
 
 | | |
 | --- | --- |
-| Sample rate | 40 Msps complex, native 14-bit IQ; residual losses and intermittent overruns remain |
-| Band | 2.4 GHz (channels 1–13) and 5 GHz U-NII-1 (36/40/44/48), 40 Msps each, brought up through the stock Wi-Fi stack. Tuning is on the Wi-Fi channel grid (see limitations) |
+| Sample rate | 40 Msps complex, native 14-bit IQ; bounded runs pass, indefinite continuity remains unproven |
+| Band | 2.4 GHz and 5 GHz U-NII-1, configured and read back at 40 MHz channel width, 40 Msps each. 2.4 GHz uses monitor mode to avoid AP coexistence fallback. Tuning uses HE40 block centres (see limitations) |
 | Transport | kernel worker copies/converts capture data into UDP packets on the 2.5 GbE port; no userspace relay |
 | Format | VITA 49 (VRT): Signal-Data packets carrying Ci8 or Ci16 (full 14-bit), a periodic IF-Context packet announcing centre frequency, sample rate and data format. A packed 14-bit profile is decoded by the bridge and SoapyVITA49; no device packer emits it yet. Also a legacy fixed-header mode |
-| Control | the vendored viewer drives the board over its on-device C2 daemon (UDP, no SSH); an experimental VITA 49.2 command subset (tune/rate) serves SoapySDR/VITA 49.2 applications. Gain/bandwidth writes are unsupported; live controller interoperability is pending |
-| Smoothness | the MAC is held receive-only (ARB_SCR TX-disable) during capture, as W1700K's firmware does, reducing contention; this has not eliminated the residual overrun |
+| Control | the vendored viewer drives the board over its on-device C2 daemon (UDP, no SSH); an experimental VITA 49.2 command subset (tune/rate) serves SoapySDR/VITA 49.2 applications. Gain and bandwidth changes are unsupported; unchanged bandwidth/rate requests are acknowledged. Live Soapy frequency commands and resumed Ci16 reads passed with the timeout-fixed client and explicit C2 capture start/stop |
+| Smoothness | the MAC is held receive-only (ARB_SCR TX-disable) during capture, as W1700K's firmware does, reducing contention; bounded clean runs do not establish indefinite operation |
 | Host | a VITA 49 → shared-memory bridge feeds W1700K-SDR's `w1700k-spectrum` (262k-point FFT, browser UI); VITA receiver compatibility depends on the supported packet profile |
 
-40 Msps is the demonstrated operating rate, not a proven silicon ceiling.
-80 Msps has overrun the current capture/export path. At 16 bits each for I and
-Q, 80 Msps requires 2.56 Gb/s before packet overhead, exceeding a 2.5 GbE link.
-Packed 14-bit transport would use 2.24 Gb/s before overhead, but is unimplemented
-and would still need capture, CPU and network validation.
+40 Msps is the validated operating rate. Ci16 preserves the captured 14-bit
+components. At 80 Msps, Ci16 needs 2.56 Gb/s before packet overhead and cannot
+fit 2.5 GbE. Ci8 fits; one bounded transport test delivered all 819.2 million
+sample words in 10.24 seconds, but that HE20 test contained repeated samples
+and does **not** prove 80 MHz RF bandwidth or 80 million independent samples/s.
+Packed-14 device output remains unimplemented. 40 MHz channel width on both
+bands at 40 Msps Ci16 was confirmed in bounded on-hardware tests; calibrated
+passband flatness and indefinite gap-free operation remain unproven.
 
 ## Design approach and limitations
 
 This project drives the **stock** MediaTek Wi-Fi firmware from Linux (plus a
 small injected firmware producer), rather than replacing it with a full custom
 WM as [W1700K-SDR](https://github.com/h0m3us3r/w1700k-sdr) does on the MT7996.
-That reached a working wideband receiver without a months-long nds32 firmware
-port. It also sets the current limits — each is a consequence of using the
-Wi-Fi stack's own radio bring-up, not a fundamental property of the silicon:
+The stock stack handles radio bring-up, with the following implemented profiles
+and verification limits:
 
-- **Tuning is on the Wi-Fi channel grid.** The radio is moved by setting a Wi-Fi
-  channel, so the native tune points are 2.4 GHz channels 1–13 (5 MHz steps) and
-  5 GHz U-NII-1 channels 36/40/44/48. The viewer's controller snaps any entered
-  frequency to the nearest centre, and because the 40 MHz capture window is wider
-  than the channel spacing the requested frequency still lands inside it.
-  Arbitrary-Hz tuning would require driving the synthesizer directly, which is
-  not wired up.
-- **~20 MHz usable passband.** The analog filter is HE20; the 40 Msps sample
-  rate spans 40 MHz but the flat passband is about 20 MHz.
-- **40 Msps.** 80 Msps overruns the capture/export path (about 96 % at best);
-  lossless higher rates would need a firmware packer.
+- **Tuning uses HE40 block centres.** Supported centres are 2422–2462 MHz
+  in 5 MHz steps on 2.4 GHz, and 5190/5230 MHz on 5 GHz. The controller snaps
+  requests to this grid. These are the block centres reported by `iw center1`,
+  rather than the primary Wi-Fi channel. Regulatory availability still applies.
+- **40 MHz channel width on both bands.** The operating width is verified before
+  capture; a fallback to 20 MHz is rejected. The 40 Msps complex stream spans
+  40 MHz, but calibrated passband flatness, edge response and alias rejection
+  have not been measured. Ambient Wi-Fi spectra cannot establish a flat ±20 MHz
+  response; no such flatness claim is made.
+- **40 Msps operating profile.** Both bands use their verified sample-lane layout.
+  Higher transport throughput alone does not establish higher RF bandwidth or
+  independent sample rate. Long-run continuity remains a separate validation.
 - **~25 s per retune or band change.** A tune reloads the Wi-Fi radio and waits
   to settle; it is not an instant mid-stream hop.
 - **5 GHz limited to U-NII-1 (5170–5260 MHz).** Higher 5 GHz channels are
   DFS/regulatory-gated through the Wi-Fi stack.
 
-A full custom-WM port would lift these (arbitrary tuning, higher rates) at the
-cost of a large reverse-engineering effort with uncertain gain on this smaller
-SoC. Either way the firmware it produces is a patch on MediaTek's proprietary
-blob and is not redistributable as a built binary — see
+A full custom-WM port could provide more control over tuning and capture, at
+the cost of a large reverse-engineering effort with uncertain gain on this SoC.
+The resulting firmware is a patch on MediaTek's proprietary blob and is not redistributable as a built binary — see
 [docs/reproduce.md](docs/reproduce.md).
 
 ## Repository

@@ -94,12 +94,11 @@ static const char *kv(const char *req, const char *key, const char *def, char *o
 }
 
 /* The central helper verifies UCI against the operating channel. */
-static int profile(unsigned long long *freq, unsigned *rate, unsigned *band, unsigned *bw)
+static int profile(unsigned long long *freq, unsigned *rate, unsigned *band, unsigned *bw, unsigned *width)
 {
-    unsigned width;
     FILE *p = popen("/root/iq-radio.sh --profile", "r");
     if (!p) return 0;
-    int n = fscanf(p, "%llu %u %u %u %u", freq, rate, &width, band, bw);
+    int n = fscanf(p, "%llu %u %u %u %u", freq, rate, width, band, bw);
     int rc = pclose(p);
     return n == 5 && rc == 0 && *band <= 1;
 }
@@ -160,9 +159,9 @@ int main(void)
 		} else if (!strncmp(req, "PROFILE", 7)) {
 			/* Current radio centre/rate/band over the network, so a controller
 			 * need not SSH in to read it. */
-			unsigned long long f; unsigned r, b, w;
-			if (profile(&f, &r, &b, &w))
-				snprintf(reply, sizeof(reply), "OK freq=%llu rate=%u band=%u bw=%u", f, r, b, w);
+			unsigned long long f; unsigned r, b, w, width;
+			if (profile(&f, &r, &b, &w, &width))
+				snprintf(reply, sizeof(reply), "OK freq=%llu rate=%u band=%u bw=%u bandwidth=%u", f, r, b, w, width);
 			else
 				snprintf(reply, sizeof(reply), "ERR radio profile unavailable");
 		} else if (!strncmp(req, "STOP", 4)) {
@@ -177,8 +176,8 @@ int main(void)
         } else if (!strncmp(req, "START", 5)) {
             char port[16], rate[16], freq[32], fmt[16], pkts[16], mac[64], iface[64], src[INET_ADDRSTRLEN];
             unsigned long long actual_freq;
-            unsigned actual_rate, actual_band, actual_bw;
-            if (!profile(&actual_freq, &actual_rate, &actual_band, &actual_bw)) {
+            unsigned actual_rate, actual_band, actual_bw, actual_width;
+            if (!profile(&actual_freq, &actual_rate, &actual_band, &actual_bw, &actual_width)) {
                 snprintf(reply, sizeof(reply), "ERR radio profile unavailable");
             } else {
                 char default_freq[32], default_rate[16], band[8], bw[8];

@@ -134,6 +134,15 @@ ssh_board 'set -e
         fi
     done
     uci commit firewall; /etc/init.d/firewall reload >/dev/null 2>&1
+    # Start with a 40 MHz receive-only block centred at 2437 MHz. Monitor mode
+    # avoids AP coexistence reducing the requested 40 MHz width to 20 MHz.
+    uci set wireless.radio0.disabled=0
+    uci set wireless.radio1.disabled=1
+    uci set wireless.radio0.channel=4
+    uci set wireless.radio0.htmode=HE40
+    uci set wireless.default_radio0.mode=monitor
+    uci -q delete wireless.default_radio0.network || true
+    uci commit wireless
     /etc/init.d/fwguard enable
     /etc/init.d/sdrdriverguard enable
     /etc/init.d/owrt-sdr-prepare enable

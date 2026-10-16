@@ -43,6 +43,7 @@ tools/ldscripts/
 /docs/review-2026-10-15.md
 /docs/offline-fixes-2026-10-15.md
 /docs/live-validation-2026-10-15.md
+/docs/he40-validation.md
 /docs/packed14-review.md
 
 # Superseded by kernel/mt7915-icap/complete-local.patch; kept locally only.

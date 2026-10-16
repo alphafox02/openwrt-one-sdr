@@ -135,26 +135,27 @@ class Adapter(unittest.TestCase):
         self.assertFalse(adapter.running)
     def test_snap_to_nearest_channel(self):
         self.assertEqual(adapter.snap(2450000000), 2452000000)   # 2.4 GHz, 5 MHz grid
-        self.assertEqual(adapter.snap(2400000000), 2412000000)   # clamp low
-        self.assertEqual(adapter.snap(5195000000), 5200000000)   # 5 GHz U-NII-1
-        self.assertEqual(adapter.snap(5300000000), 5240000000)   # clamp high
+        self.assertEqual(adapter.snap(2400000000), 2422000000)   # clamp low
+        self.assertEqual(adapter.snap(5195000000), 5190000000)   # 5 GHz U-NII-1
+        self.assertEqual(adapter.snap(5300000000), 5230000000)   # clamp high
     def test_retune_snaps_settles_and_restarts(self):
         reqs=[]; adapter.running=True
         def c2d(req, timeout=8.0):
             reqs.append(req)
-            if req.startswith('PROFILE'): return 'OK freq=5180000000 rate=40000000 band=1 bw=0'
+            if req.startswith('PROFILE'): return 'OK freq=5190000000 rate=40000000 band=1 bw=0 bandwidth=40000000'
             if req.startswith('STOP'):    return 'OK stopped'
-            if req.startswith('TUNE'):    return 'OK tuned freq=5180000000 capture=stopped'
-            if req.startswith('START'):   return 'OK streaming to 10.77.0.11:4991 fmt=vrt16 freq=5180000000 rate=40'
+            if req.startswith('TUNE'):    return 'OK tuned freq=5190000000 capture=stopped'
+            if req.startswith('START'):   return 'OK streaming to 10.77.0.11:4991 fmt=vrt16 freq=5190000000 rate=40'
             return 'OK'
         with mock.patch.object(adapter,'c2d',side_effect=c2d), mock.patch.object(adapter,'log'):
-            adapter.do_tune(5178000000)   # off-grid: must snap to 5180000000
+            adapter.do_tune(5178000000)   # off-grid: must snap to 5190000000
         self.assertTrue(reqs[0].startswith('STOP'))
-        self.assertIn('TUNE freq=5180000000', reqs[1])
+        self.assertIn('TUNE freq=5190000000', reqs[1])
         self.assertIn('PROFILE', reqs[2])
         self.assertTrue(reqs[-1].startswith('START'))
         self.assertEqual(adapter.state()['radio']['rf_band'], 1)
         self.assertTrue(adapter.running)
+        self.assertEqual(adapter.rf_width,40000000)
 
 class Boot(unittest.TestCase):
     def test_preparation_latches_and_falls_back(self):
@@ -243,25 +244,60 @@ case "$*" in
 *radio1.disabled) echo 0;;
 *radio1.sdr_sample_rate) echo 40000000;;
 *radio1.channel) echo 36;;
-*radio1.htmode) echo HE20;;
+*radio1.htmode) echo HE40;;
 *) exit 99;;
 esac
 ''')
-            (d/'iw').write_text('#!/bin/sh\necho "channel 36 (5180 MHz), width: 20 MHz, center1: 5180 MHz"\n')
+            (d/'iw').write_text('#!/bin/sh\necho "channel 36 (5180 MHz), width: 40 MHz, center1: 5190 MHz"\n')
             for f in d.iterdir(): f.chmod(0o755)
             env=dict(os.environ,PATH=f"{d}:"+os.environ['PATH'])
             helper=str(ROOT/'tools/live/iq-radio.sh')
-            for cmd in [('tune','5180000000'),('rate','40000000')]:
+            for cmd in [('tune','5190000000'),('rate','40000000')]:
                 subprocess.run([helper,*cmd],env=env,check=True,capture_output=True)
 
+    def test_actual_he40_centre_and_width_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            d=Path(td)
+            (d/'uci').write_text("""#!/bin/sh
+case "$*" in
+*radio0.disabled) echo 0;;
+*radio1.disabled) echo 1;;
+*radio0.channel) echo 6;;
+*radio0.htmode) echo HE40;;
+*default_radio0.mode) echo monitor;;
+*) exit 99;;
+esac
+""")
+            iw=d/'iw'
+            env=dict(os.environ,PATH=f"{d}:"+os.environ['PATH'])
+            helper=str(ROOT/'tools/live/iq-radio.sh')
+            (d/'uci').chmod(0o755)
+            iw.write_text('#!/bin/sh\necho "type monitor\nchannel 6 (2437 MHz), width: 40 MHz, center1: 2447 MHz"\n')
+            iw.chmod(0o755)
+            result=subprocess.run([helper,'--profile'],env=env,check=True,capture_output=True,text=True)
+            self.assertEqual(result.stdout.strip(),'2447000000 40000000 40000000 0 0')
+            iw.write_text('#!/bin/sh\necho "type monitor\nchannel 6 (2437 MHz), width: 20 MHz, center1: 2437 MHz"\n')
+            self.assertNotEqual(subprocess.run([helper,'--profile'],env=env,capture_output=True).returncode,0)
+
 class Apply(unittest.TestCase):
+    def test_bandwidth_ack_matches_readback(self):
+        with tempfile.TemporaryDirectory() as td:
+            helper=Path(td)/'radio'
+            helper.write_text('#!/bin/sh\necho "5190000000 40000000 40000000"\n')
+            helper.chmod(0o755)
+            env=dict(os.environ,IQ_RADIO_HELPER=str(helper))
+            for width,code in [('40000000',0),('20000000',1)]:
+                for check in [[],['--check']]:
+                    result=subprocess.run(['sh',str(ROOT/'host/controller/vita49-apply.sh'),*check,'bandwidth_hz',width],env=env)
+                    self.assertEqual(result.returncode,code)
+
     def test_only_exact_rf_centres_validate(self):
         hook=ROOT/'host/controller/vita49-apply.sh'
         env = dict(os.environ, IQ_RADIO_HELPER=str(ROOT/'tools/live/iq-radio.sh'))
-        for value in ('2412000000','2437000000','2472000000','5180000000'):
+        for value in ('2422000000','2437000000','2462000000','5190000000','5230000000'):
             self.assertEqual(subprocess.run(['sh',str(hook),'--check','rf_freq_hz',value],env=env).returncode,0)
         for field,value in [('sample_rate_hz','80000000'),('gain_db','3.25'),
-                            ('rf_freq_hz','5190000000'),('rf_freq_hz','2437500000'),
+                            ('rf_freq_hz','5180000000'),('rf_freq_hz','2437500000'),
                             ('rf_freq_hz','nan'),('rf_freq_hz','-1')]:
             self.assertNotEqual(subprocess.run(['sh',str(hook),'--check',field,value],env=env,stderr=subprocess.DEVNULL).returncode,0)
 

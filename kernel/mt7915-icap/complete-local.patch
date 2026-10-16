@@ -398,7 +398,7 @@
 +};
 --- /dev/null
 +++ b/mt7915/udp-export.inc
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,376 @@
 +/* SPDX-License-Identifier: ISC
 + * MT7981 IQ export: consume native DMA skbs before relay linearization/copying.
 + * A bounded skb queue feeds an Ethernet worker. Each worker reads every
@@ -411,6 +411,7 @@
 + *                     full 14-bit capture resolution left-justified into 16
 + *                     bits; a periodic IF-Context packet announces RF
 + *                     frequency, sample rate and data format.
++ * Optional ninth config token: native word stride in bytes (4 default or 8).
 + * A native sample word packs signed 14-bit I in bits [29:16] and 14-bit Q in
 + * bits [13:0]. CI8 keeps the top 8 bits of each; Ci16 left-justifies the 14.
 + * IQD1 header (32 bytes, little endian): magic, run, sequence, offset(u16),
@@ -436,7 +437,7 @@
 +	u8 mac[ETH_ALEN];
 +	u32 rate, run;
 +	u64 freq;
-+	u16 fmt;
++	u16 fmt, stride;
 +	u8 context_count;
 +	u32 sig_ctr;
 +	atomic64_t received, dropped, sent, tx_errors, tx_busy;
@@ -525,15 +526,16 @@
 +}
 +
 +/* Convert the selected RF path directly from skb fragments. Native buffers
-+ * contain 2048 consecutive path0 words (CR10 64-to-128 packing enabled).
++ * use a verified per-run word stride: 4 for dense path0, 8 for alternating
++ * paths. The RF profile selects this independently of the wire sample format.
 + * Sequential mapping also works if a sample crosses a fragment boundary. */
 +static int mt7915_iq_convert(struct sk_buff *in, struct skb_seq_state *st,
-+                            unsigned offset, unsigned count, u8 *dst, int bits)
++                            unsigned offset, unsigned count, u8 *dst, int bits, unsigned stride)
 +{
 +    while (count) {
 +        const u8 *src;
 +        unsigned available = skb_seq_read(offset, &src, st);
-+        unsigned n = min(count, available / 4), i;
++        unsigned n = min(count, available / stride), i;
 +        if (!n) {
 +            u8 word[4];
 +            u32 v;
@@ -541,10 +543,10 @@
 +            v = get_unaligned_le32(word);
 +            if (bits == 16) { put_unaligned_be32((v << 2) & 0xfffcfffc, dst); dst += 4; }
 +            else { *dst++ = v >> 22; *dst++ = v >> 6; }
-+            offset += 4; count--; continue;
++            offset += stride; count--; continue;
 +        }
-+        for (i = 0; i + 1 < n; i += 2, src += 8) {
-+            u32 a = get_unaligned_le32(src), b = get_unaligned_le32(src + 4);
++        for (i = 0; i + 1 < n; i += 2, src += 2 * stride) {
++            u32 a = get_unaligned_le32(src), b = get_unaligned_le32(src + stride);
 +            if (bits == 16) {
 +                u64 pair = ((u64)a << 32) | b;
 +                put_unaligned_be64((pair << 2) & 0xfffcfffcfffcfffcULL, dst);
@@ -560,7 +562,7 @@
 +            if (bits == 16) { put_unaligned_be32((v << 2) & 0xfffcfffc, dst); dst += 4; }
 +            else { *dst++ = v >> 22; *dst++ = v >> 6; }
 +        }
-+        offset += n * 4; count -= n;
++        offset += n * stride; count -= n;
 +    }
 +    return 0;
 +}
@@ -580,6 +582,7 @@
 +			u8 meta[8];
 +			struct skb_seq_state seqst;
 +			int half, convert_ret;
++            unsigned samples = 8192 / x->stride;
 +			if (skb_copy_bits(in, 36, meta, sizeof(meta))) {
 +				atomic64_inc(&x->dropped);
 +				kfree_skb(in);
@@ -588,7 +591,7 @@
 +			seq = get_unaligned_le32(meta);
 +			source = get_unaligned_le32(meta + 4);
 +			if (x->fmt == IQ_FMT_IQD1) {
-+			for (half = 0; half < 4; half++) {
++			for (half = 0; half < samples / 512; half++) {
 +				struct sk_buff *out;
 +				u8 *h, *data;
 +				const unsigned int payload = 32 + 1024;
@@ -598,7 +601,7 @@
 +				h = skb_put_zero(out, 32);
 +				memcpy(h, "IQD1", 4);
 +				put_unaligned_le32(x->run, h+4);
-+				put_unaligned_le32(seq * 2 + half / 2, h+8);
++				put_unaligned_le32(seq * (samples / 1024) + half / 2, h+8);
 +				put_unaligned_le16((half % 2)*512, h+12);
 +				put_unaligned_le16(512, h+14);
 +				put_unaligned_le32(x->rate, h+16);
@@ -606,7 +609,7 @@
 +				put_unaligned_le32(source, h+24);
 +				data = skb_put(out, 1024);
 +                skb_prepare_seq_read(in, 44, 44 + 8192, &seqst);
-+                convert_ret = mt7915_iq_convert(in, &seqst, half * 2048, 512, data, 8);
++                convert_ret = mt7915_iq_convert(in, &seqst, half * 512 * x->stride, 512, data, 8, x->stride);
 +                skb_abort_seq_read(&seqst);
 +                if (convert_ret) {
 +                    kfree_skb(out); atomic64_inc(&x->dropped); break;
@@ -616,14 +619,14 @@
 +			} else {
 +				int bits = (x->fmt == IQ_FMT_VRT16) ? 16 : 8;
 +				int bps = (bits == 16) ? 4 : 2;
-+				/* Six MTU-safe packets per packed path0 buffer at full resolution. */
-+				int chunk = bits == 16 ? 360 : 512;
-+				int nchunks = DIV_ROUND_UP(2048, chunk);
++				/* MTU-safe chunks; sample count depends on the selected native lane. */
++				int chunk = bits == 16 ? 360 : 720;
++				int nchunks = DIV_ROUND_UP(samples, chunk);
 +				int c;
 +				for (c = 0; c < nchunks; c++) {
 +					struct sk_buff *out;
 +					u8 *p, *d;
-+					int nsamples = min(chunk, 2048 - c * chunk);
++					int nsamples = min(chunk, (int)samples - c * chunk);
 +					unsigned int payload = 8 + nsamples * bps;
 +
 +					if ((x->sig_ctr++ % 128) == 0)
@@ -637,7 +640,7 @@
 +					put_unaligned_be32(1, p + 4);          /* stream ID */
 +					d = skb_put(out, nsamples * bps);
 +                    skb_prepare_seq_read(in, 44, 44 + 8192, &seqst);
-+                    convert_ret = mt7915_iq_convert(in, &seqst, c * chunk * 4, nsamples, d, bits);
++                    convert_ret = mt7915_iq_convert(in, &seqst, c * chunk * x->stride, nsamples, d, bits, x->stride);
 +                    /* kmap_atomic mappings must end before xmit can reschedule. */
 +                    skb_abort_seq_read(&seqst);
 +                    if (convert_ret) {
@@ -702,7 +705,7 @@
 +	struct mt7915_dev *dev=file->private_data;
 +	struct mt7915_iq_export *x;
 +	char text[160], iface[IFNAMSIZ], src[16], dst[16], mac[18], fmt[8]="";
-+	unsigned int port, rate;
++	unsigned int port, rate, stride = 4;
 +	unsigned long long freq=0;
 +	int ret=-EINVAL, nf;
 +	if (!count || count >= sizeof(text)) return -EINVAL;
@@ -712,9 +715,9 @@
 +	if (sysfs_streq(text,"stop")) {
 +		mt7915_iq_stop_locked(dev); ret=count; goto out;
 +	}
-+	nf = sscanf(text,"%15s %15s %15s %17s %u %u %llu %7s",
-+		    iface,src,dst,mac,&port,&rate,&freq,fmt);
-+	if (nf<6 || !port || port>65535 || (rate!=20000000 && rate!=40000000 && rate!=80000000)) goto out;
++	nf = sscanf(text,"%15s %15s %15s %17s %u %u %llu %7s %u",
++		    iface,src,dst,mac,&port,&rate,&freq,fmt,&stride);
++	if ((stride != 4 && stride != 8) || nf<6 || !port || port>65535 || (rate!=20000000 && rate!=40000000 && rate!=80000000)) goto out;
 +	if (rcu_access_pointer(dev->iq_export)) { ret=-EBUSY; goto out; }
 +	x=kzalloc(sizeof(*x),GFP_KERNEL);
 +	if (!x) { ret=-ENOMEM; goto out; }
@@ -731,7 +734,8 @@
 +	x->netdev=dev_get_by_name(&init_net,iface);
 +	if (!x->netdev) { ret=-ENODEV; goto free; }
 +	if (!netif_running(x->netdev) || x->netdev->type!=ARPHRD_ETHER ||
-+	    x->netdev->mtu < (x->fmt==IQ_FMT_VRT16 ? 1476 : 1084)) goto put;
++	    x->netdev->mtu < (x->fmt==IQ_FMT_IQD1 ? 1084 : 1476)) goto put;
++	x->stride=stride;
 +	x->port=htons(port); x->rate=rate; x->run=(u32)ktime_get_ns();
 +	skb_queue_head_init(&x->queue); init_waitqueue_head(&x->wait);
 +	x->task=kthread_create(mt7915_iq_worker,x,"iq-udp");
@@ -758,9 +762,9 @@
 +	mutex_lock(&mt7915_iq_config_lock);
 +	x=rcu_dereference_protected(dev->iq_export,lockdep_is_held(&mt7915_iq_config_lock));
 +	if (!x) n=scnprintf(text,sizeof(text),"stopped\n");
-+	else n=scnprintf(text,sizeof(text),"run=%u fmt=%s freq=%llu rate=%u received=%lld dropped=%lld sent=%lld tx_errors=%lld queued=%u rx_pid=%d tx_busy=%lld\n",
++	else n=scnprintf(text,sizeof(text),"run=%u fmt=%s freq=%llu rate=%u stride=%u received=%lld dropped=%lld sent=%lld tx_errors=%lld queued=%u rx_pid=%d tx_busy=%lld\n",
 +		x->run,x->fmt==IQ_FMT_VRT16?"vrt16":x->fmt==IQ_FMT_VRT8?"vrt8":"iqd1",
-+		x->freq,x->rate,atomic64_read(&x->received),atomic64_read(&x->dropped),
++		x->freq,x->rate,x->stride,atomic64_read(&x->received),atomic64_read(&x->dropped),
 +		atomic64_read(&x->sent),atomic64_read(&x->tx_errors),skb_queue_len(&x->queue),
 +		dev->mt76.napi[MT_RXQ_MCU].thread ? task_pid_nr(dev->mt76.napi[MT_RXQ_MCU].thread) : 0,
 +		atomic64_read(&x->tx_busy));

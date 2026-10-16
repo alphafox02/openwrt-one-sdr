@@ -18,8 +18,10 @@ sample_rate_hz)
     ;;
 bandwidth_hz)
     # RF filter changes are not implemented; only acknowledge an unchanged width.
-    [ "$2" = 20000000 ] || exit 1
-    "$RADIO" --state >/dev/null
+    requested=$2
+    actual=$("$RADIO" --state) || exit 1
+    set -- $actual
+    [ "$#" -eq 3 ] && [ "$requested" = "$3" ]
     ;;
 *) echo "unsupported control: $1" >&2; exit 1;;
 esac
