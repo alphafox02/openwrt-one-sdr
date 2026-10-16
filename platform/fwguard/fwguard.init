@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+# fwguard: restore pristine WiFi firmware (rom_patch/wm/wa) at boot = crash
+# self-heal for live firmware-patch testing. Armed one-shot installs test
+# image(s) exactly once, so a wedging patch auto-reverts to gold on the next
+# (power-cycle) boot with no serial rescue. Test via reboot ONLY, never
+# rmmod/modprobe mt7915e (that wedges the device).
+START=01
+FWDIR=/lib/firmware/mediatek
+# name : gold-copy : optional test-image (installed once when armed)
+set -- rom_patch:/root/rom_patch.gold:/root/rom_patch.test \
+       wm:/root/wm.gold:/root/wm.test \
+       wa:/root/wa.gold:/root/wa.test
+boot() {
+	ARM=/root/fwguard.arm
+	UP=$(cut -d. -f1 /proc/uptime); echo "$UP" > /root/fwguard.lastrun
+	armed=0; [ -f "$ARM" ] && { armed=1; rm -f "$ARM"; sync; }   # consume first
+	for spec in "$@"; do
+		name=${spec%%:*}; rest=${spec#*:}; gold=${rest%%:*}; test=${rest##*:}
+		f="$FWDIR/mt7981_${name}.bin"
+		[ -f "$gold" ] || continue
+		if [ "$armed" = 1 ] && [ -f "$test" ]; then
+			cp "$test" "$f"; logger -t fwguard "ARMED installed $name test (up=${UP}s)"
+		else
+			cp "$gold" "$f"
+		fi
+	done
+	sync
+}

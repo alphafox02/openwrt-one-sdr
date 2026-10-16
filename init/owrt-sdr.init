@@ -1,0 +1,59 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: MIT
+# Late startup for the pair selected by owrt-sdr-prepare before kmodloader.
+# No rmmod/insmod: live reload has wedged this board in previous trials.
+START=99
+STOP=10
+SDR_FW=/root/firmware/mt7981_wm.sdr.bin
+ACTIVE_FW=/lib/firmware/mediatek/mt7981_wm.bin
+DRIVER=/root/mt7915e.vrt.ko
+ACTIVE_DRIVER=/lib/modules/$(uname -r)/mt7915e.ko
+PIDFILE=/tmp/vita49-control.pid
+LOG=/tmp/vita49-control.log
+LATCH=/root/firmware/owrt-sdr.pending
+SELECTED=/tmp/owrt-sdr.selected
+READY=/tmp/owrt-sdr.ready
+SDR_LINK=eth0
+SDR_IP=10.77.0.10/24
+CONTROL=/root/vita49-control
+C2D=/root/iq-c2d
+C2D_PIDFILE=/tmp/iq-c2d.pid
+APPLY=/root/vita49-apply.sh
+STOP_CAPTURE=/root/iq-udp-stop.sh
+ICAP_HELPER=/root/icap-device.sh
+
+start() {
+    [ -f "$READY" ] && return 0
+    [ -f "$SELECTED" ] && cmp -s "$SDR_FW" "$ACTIVE_FW" && cmp -s "$DRIVER" "$ACTIVE_DRIVER" || {
+        logger -t owrt-sdr 'SDR pair not selected at boot; leaving radio unchanged'; return 1;
+    }
+    [ -x "$CONTROL" ] && [ -x "$APPLY" ] || return 1
+    # Confirm that the custom driver actually loaded, without reading registers.
+    [ -r "$ICAP_HELPER" ] && . "$ICAP_HELPER" && [ -e "$D/iq_udp" ] || return 1
+    touch "$LATCH" && sync || return 1
+    wifi up || return 1
+    if [ -n "$SDR_IP" ]; then
+        ip addr replace "$SDR_IP" dev "$SDR_LINK" || return 1
+    fi
+    sleep 25
+    # Launch via sh so the responder's output is captured; the shell exec's into
+    # the responder, so the pidfile still tracks it and stop() kills it directly.
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- -c \
+        "exec '$CONTROL' --addr 0.0.0.0 --port 4991 --apply '$APPLY' --readback >>'$LOG' 2>&1" \
+        || return 1
+    sleep 1
+    [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null || return 1
+    # The on-device C2 daemon the vendored viewer drives over the network (no SSH);
+    # VITA 49.2 (the responder above) serves other SoapySDR/VITA 49.2 applications.
+    [ -x "$C2D" ] && start-stop-daemon -S -b -m -p "$C2D_PIDFILE" -x "$C2D"
+    touch "$READY" || return 1
+    logger -t owrt-sdr 'control responder + C2 daemon started; capture and live interop still require verification'
+}
+stop() {
+    # Retain the boot latch on any failure. Do not unload an active DMA producer.
+    [ -f "$READY" ] || return 0
+    "$STOP_CAPTURE" || return 1
+    start-stop-daemon -K -p "$C2D_PIDFILE" 2>/dev/null
+    start-stop-daemon -K -p "$PIDFILE" || return 1
+    rm -f "$READY" "$PIDFILE" "$C2D_PIDFILE" "$LATCH" && sync
+}

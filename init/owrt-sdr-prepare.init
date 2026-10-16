@@ -1,0 +1,46 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: MIT
+# Select the firmware/module before S10 kmodloader. No live module unloading.
+START=03
+EXTRA_COMMANDS="rearm"
+EXTRA_HELP="        rearm   Permit one SDR boot after a failed/unclean run"
+SDR_FW=/root/firmware/mt7981_wm.sdr.bin
+GOLD_FW=/root/wm.gold
+ACTIVE_FW=/lib/firmware/mediatek/mt7981_wm.bin
+SDR_DRIVER=/root/mt7915e.vrt.ko
+GOLD_DRIVER=/root/mt7915e.stock.ko
+ACTIVE_DRIVER=/lib/modules/$(uname -r)/mt7915e.ko
+LATCH=/root/firmware/owrt-sdr.pending
+SELECTED=/tmp/owrt-sdr.selected
+
+restore_stock() {
+    cp "$GOLD_FW" "$ACTIVE_FW" && cp "$GOLD_DRIVER" "$ACTIVE_DRIVER" && sync
+}
+boot() {
+    rm -f "$SELECTED"
+    # These backups must already exist; never back up a potentially patched file.
+    [ -s "$GOLD_FW" ] && [ -s "$GOLD_DRIVER" ] || {
+        logger -t owrt-sdr 'gold backups missing; cannot select SDR'; return 1;
+    }
+    if [ -e "$LATCH" ]; then
+        logger -t owrt-sdr 'unclean/failed SDR run: restoring stock; explicit rearm required'
+        restore_stock
+        return $?
+    fi
+    [ -s "$SDR_FW" ] && [ -s "$SDR_DRIVER" ] || { restore_stock; return 1; }
+    # Persist before either active file changes. A crash at any later point
+    # selects gold on the next boot. Only a clean service stop clears this.
+    touch "$LATCH" && sync || return 1
+    if ! cp "$SDR_FW" "$ACTIVE_FW" || ! cp "$SDR_DRIVER" "$ACTIVE_DRIVER"; then
+        restore_stock
+        return 1
+    fi
+    sync
+    touch "$SELECTED"
+}
+rearm() {
+    # Does not change a running radio. The next boot is the test.
+    rm -f "$LATCH" && sync
+}
+# start intentionally does not prepare files after the kernel has loaded them.
+start() { logger -t owrt-sdr 'preparation occurs at boot; reboot to apply staged files'; return 1; }
